@@ -7,6 +7,8 @@ use std::io::{BufRead, BufReader};
 use std::path::PathBuf;
 use walkdir::WalkDir;
 
+use crate::tools::glob::glob_match;
+
 fn default_max_results() -> usize {
     50
 }
@@ -134,36 +136,6 @@ fn search_file(
             }
         }
     }
-}
-
-fn glob_match(pattern: &str, name: &str) -> bool {
-    // Simple glob: support * (any chars except /) and ** (any chars including /)
-    let re_str = glob_to_regex(pattern);
-    regex::Regex::new(&re_str)
-        .map(|r| r.is_match(name))
-        .unwrap_or(false)
-}
-
-fn glob_to_regex(pattern: &str) -> String {
-    let mut result = String::from("^");
-    let mut chars = pattern.chars().peekable();
-    while let Some(c) = chars.next() {
-        match c {
-            '*' if chars.peek() == Some(&'*') => {
-                chars.next();
-                result.push_str(".*");
-            }
-            '*' => result.push_str("[^/]*"),
-            '?' => result.push_str("[^/]"),
-            '.' | '+' | '^' | '$' | '{' | '}' | '(' | ')' | '|' | '[' | ']' | '\\' => {
-                result.push('\\');
-                result.push(c);
-            }
-            _ => result.push(c),
-        }
-    }
-    result.push('$');
-    result
 }
 
 fn is_likely_binary(path: &std::path::Path) -> bool {

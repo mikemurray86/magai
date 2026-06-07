@@ -107,23 +107,40 @@ impl DynAgent {
     }
 }
 
+/// Wraps a built `rig` agent in the type-erased `DynAgent` closure that
+/// normalizes its stream items via `map_item`. Shared by all provider builders
+/// so the stream-adaptation logic lives in exactly one place.
+///
+/// A macro rather than a generic fn: `StreamingChat<M, R>` carries two
+/// generic parameters with model-specific bounds, so a generic function would
+/// need to restate them; each call site already has a concrete agent type.
+macro_rules! dyn_agent_from {
+    ($agent:expr) => {{
+        let agent = Arc::new($agent);
+        DynAgent(Box::new(move |msg, hist| {
+            let agent = Arc::clone(&agent);
+            Box::pin(async move {
+                let raw = agent.stream_chat(msg, hist).await;
+                Box::pin(raw.filter_map(|item| async move { map_item(item) })) as OurStream
+            })
+        }))
+    }};
+}
+
 // ── provider builders ─────────────────────────────────────────────────────────
 
-fn build_ollama(model: &str, preamble: &str, tool_server: Option<ToolServerHandle>) -> DynAgent {
-    let client = ollama::Client::new(Nothing).unwrap();
+fn build_ollama(
+    model: &str,
+    preamble: &str,
+    tool_server: Option<ToolServerHandle>,
+) -> Result<DynAgent, String> {
+    let client = ollama::Client::new(Nothing).map_err(|e| e.to_string())?;
     let b = client.agent(model).preamble(preamble);
     let agent = match tool_server {
         Some(handle) => b.tool_server_handle(handle).build(),
         None => b.build(),
     };
-    let agent = Arc::new(agent);
-    DynAgent(Box::new(move |msg, hist| {
-        let agent = Arc::clone(&agent);
-        Box::pin(async move {
-            let raw = agent.stream_chat(msg, hist).await;
-            Box::pin(raw.filter_map(|item| async move { map_item(item) })) as OurStream
-        })
-    }))
+    Ok(dyn_agent_from!(agent))
 }
 
 fn build_openai(
@@ -143,14 +160,7 @@ fn build_openai(
         Some(handle) => b.tool_server_handle(handle).build(),
         None => b.build(),
     };
-    let agent = Arc::new(agent);
-    Ok(DynAgent(Box::new(move |msg, hist| {
-        let agent = Arc::clone(&agent);
-        Box::pin(async move {
-            let raw = agent.stream_chat(msg, hist).await;
-            Box::pin(raw.filter_map(|item| async move { map_item(item) })) as OurStream
-        })
-    })))
+    Ok(dyn_agent_from!(agent))
 }
 
 fn build_anthropic(
@@ -165,14 +175,7 @@ fn build_anthropic(
         Some(handle) => b.tool_server_handle(handle).build(),
         None => b.build(),
     };
-    let agent = Arc::new(agent);
-    Ok(DynAgent(Box::new(move |msg, hist| {
-        let agent = Arc::clone(&agent);
-        Box::pin(async move {
-            let raw = agent.stream_chat(msg, hist).await;
-            Box::pin(raw.filter_map(|item| async move { map_item(item) })) as OurStream
-        })
-    })))
+    Ok(dyn_agent_from!(agent))
 }
 
 fn resolve_agent(
@@ -184,7 +187,7 @@ fn resolve_agent(
     match config.find_named_model(alias) {
         Some((nm, pc)) => {
             let agent = match pc.provider_type {
-                ProviderType::Ollama => Ok(build_ollama(&nm.model, preamble, tool_server)),
+                ProviderType::Ollama => build_ollama(&nm.model, preamble, tool_server),
                 ProviderType::OpenAI | ProviderType::Groq => {
                     let key = api_key_from_env(pc.api_key_env.as_deref())?;
                     build_openai(
@@ -206,10 +209,7 @@ fn resolve_agent(
             }?;
             Ok((agent, alias.to_string()))
         }
-        None => Ok((
-            build_ollama(alias, preamble, tool_server),
-            alias.to_string(),
-        )),
+        None => build_ollama(alias, preamble, tool_server).map(|a| (a, alias.to_string())),
     }
 }
 
@@ -512,12 +512,20 @@ pub async fn run_agent(
     let startup = config.default_model.as_deref().unwrap_or(DEFAULT_MODEL);
 
     let (mut agent, mut current_model) =
-        resolve_agent(startup, &config, &preamble, ts(tools_enabled)).unwrap_or_else(|_| {
-            (
-                build_ollama(DEFAULT_MODEL, &preamble, Some(tool_handle.clone())),
-                DEFAULT_MODEL.to_string(),
-            )
-        });
+        match resolve_agent(startup, &config, &preamble, ts(tools_enabled)) {
+            Ok(pair) => pair,
+            Err(_) => match build_ollama(DEFAULT_MODEL, &preamble, Some(tool_handle.clone())) {
+                Ok(agent) => (agent, DEFAULT_MODEL.to_string()),
+                Err(e) => {
+                    ai_tx
+                        .send(AiEvent::Error(format!(
+                            "startup: could not initialize any model agent: {e}"
+                        )))
+                        .ok();
+                    return;
+                }
+            },
+        };
 
     hook_runner.fire(
         HookEvent::SessionStart,
@@ -605,11 +613,11 @@ pub async fn run_agent(
                                 build_anthropic(&model_id, &k, &preamble, ts(tools_enabled))
                             }),
                         ProviderType::Ollama | ProviderType::Gemini => {
-                            Ok(build_ollama(&model_id, &preamble, ts(tools_enabled)))
+                            build_ollama(&model_id, &preamble, ts(tools_enabled))
                         }
                     }
                 } else {
-                    Ok(build_ollama(&model_id, &preamble, ts(tools_enabled)))
+                    build_ollama(&model_id, &preamble, ts(tools_enabled))
                 };
                 match result {
                     Ok(new_agent) => {

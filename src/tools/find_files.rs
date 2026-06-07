@@ -5,6 +5,8 @@ use serde_json::json;
 use std::path::PathBuf;
 use walkdir::WalkDir;
 
+use crate::tools::glob::glob_match;
+
 fn default_max_depth() -> usize {
     10
 }
@@ -100,33 +102,4 @@ impl Tool for FindFiles {
         files.sort();
         Ok(json!({ "files": files, "truncated": truncated }).to_string())
     }
-}
-
-fn glob_match(pattern: &str, name: &str) -> bool {
-    let re_str = glob_to_regex(pattern);
-    regex::Regex::new(&re_str)
-        .map(|r| r.is_match(name))
-        .unwrap_or(false)
-}
-
-fn glob_to_regex(pattern: &str) -> String {
-    let mut result = String::from("^");
-    let mut chars = pattern.chars().peekable();
-    while let Some(c) = chars.next() {
-        match c {
-            '*' if chars.peek() == Some(&'*') => {
-                chars.next();
-                result.push_str(".*");
-            }
-            '*' => result.push_str("[^/]*"),
-            '?' => result.push_str("[^/]"),
-            '.' | '+' | '^' | '$' | '{' | '}' | '(' | ')' | '|' | '[' | ']' | '\\' => {
-                result.push('\\');
-                result.push(c);
-            }
-            _ => result.push(c),
-        }
-    }
-    result.push('$');
-    result
 }

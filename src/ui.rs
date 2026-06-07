@@ -107,7 +107,7 @@ impl App {
 
         Self {
             messages: Vec::new(),
-            textarea: make_textarea(false),
+            textarea: make_textarea("", false),
             exit: false,
             is_waiting: false,
             user_tx,
@@ -259,7 +259,7 @@ impl App {
                     self.push_system(format!("{count} models from {provider} — ↑↓ navigate  Tab fill  Enter use  Esc dismiss"));
                     self.provider_models = Some((provider, models));
                     self.provider_model_sel = 0;
-                    self.textarea = make_textarea(false);
+                    self.textarea = make_textarea("", false);
                     self.model_ac_idx = None;
                 }
             }
@@ -824,7 +824,7 @@ impl App {
         if input.is_empty() {
             return;
         }
-        self.textarea = make_textarea(false);
+        self.textarea = make_textarea("", false);
         self.history_cursor = None;
 
         if input.starts_with('/') {
@@ -943,9 +943,9 @@ impl App {
                                 self.is_waiting = false;
                             } else if self.provider_models.is_some() {
                                 self.provider_models = None;
-                                self.textarea = make_textarea(false);
+                                self.textarea = make_textarea("", false);
                             } else {
-                                self.textarea = make_textarea(false);
+                                self.textarea = make_textarea("", false);
                                 self.history_cursor = None;
                             }
                         }
@@ -957,7 +957,7 @@ impl App {
                                 if !filtered.is_empty() {
                                     let sel = self.provider_model_sel.min(filtered.len() - 1);
                                     let model_id = filtered[sel].to_string();
-                                    self.textarea = make_textarea_with(model_id);
+                                    self.textarea = make_textarea(&model_id, false);
                                 }
                             } else {
                                 let candidates = self.model_ac_candidates();
@@ -965,7 +965,8 @@ impl App {
                                     let idx =
                                         self.model_ac_idx.unwrap_or(0).min(candidates.len() - 1);
                                     let alias = candidates[idx].alias.clone();
-                                    self.textarea = make_textarea_with(format!("/model {alias}"));
+                                    self.textarea =
+                                        make_textarea(&format!("/model {alias}"), false);
                                     self.model_ac_idx = Some(idx);
                                 } else {
                                     let provider_names = self.provider_ac_candidates();
@@ -976,7 +977,7 @@ impl App {
                                             .min(provider_names.len() - 1);
                                         let name = provider_names[idx].clone();
                                         self.textarea =
-                                            make_textarea_with(format!("/provider {name}"));
+                                            make_textarea(&format!("/provider {name}"), false);
                                         self.provider_ac_idx = Some(idx);
                                     }
                                 }
@@ -1008,7 +1009,7 @@ impl App {
                                         .ok();
                                 }
                                 self.provider_models = None;
-                                self.textarea = make_textarea(false);
+                                self.textarea = make_textarea("", false);
                             } else {
                                 let candidates = self.model_ac_candidates();
                                 if !candidates.is_empty() {
@@ -1016,7 +1017,7 @@ impl App {
                                         let alias =
                                             candidates[idx.min(candidates.len() - 1)].alias.clone();
                                         self.textarea =
-                                            make_textarea_with(format!("/model {alias}"));
+                                            make_textarea(&format!("/model {alias}"), false);
                                     }
                                 } else {
                                     let provider_names = self.provider_ac_candidates();
@@ -1026,7 +1027,7 @@ impl App {
                                                 [idx.min(provider_names.len() - 1)]
                                             .clone();
                                             self.textarea =
-                                                make_textarea_with(format!("/provider {name}"));
+                                                make_textarea(&format!("/provider {name}"), false);
                                         }
                                     }
                                 }
@@ -1070,7 +1071,7 @@ impl App {
                                         };
                                         self.history_cursor = Some(idx);
                                         let text = self.input_history[idx].clone();
-                                        self.textarea = make_textarea_with(text);
+                                        self.textarea = make_textarea(&text, false);
                                     }
                                 }
                             }
@@ -1102,10 +1103,10 @@ impl App {
                                             let next = idx + 1;
                                             self.history_cursor = Some(next);
                                             let text = self.input_history[next].clone();
-                                            self.textarea = make_textarea_with(text);
+                                            self.textarea = make_textarea(&text, false);
                                         } else {
                                             self.history_cursor = None;
-                                            self.textarea = make_textarea(false);
+                                            self.textarea = make_textarea("", false);
                                         }
                                     }
                                 }
@@ -1146,8 +1147,12 @@ impl App {
     }
 }
 
-fn make_textarea(waiting: bool) -> TextArea<'static> {
-    let mut ta = TextArea::default();
+fn make_textarea(text: &str, waiting: bool) -> TextArea<'static> {
+    let mut ta = if text.is_empty() {
+        TextArea::default()
+    } else {
+        TextArea::new(vec![text.to_string()])
+    };
     ta.set_cursor_line_style(Style::default());
     ta.set_placeholder_text("  ❯  message…  Shift+Enter for newline");
     ta.set_placeholder_style(
@@ -1162,18 +1167,6 @@ fn make_textarea(waiting: bool) -> TextArea<'static> {
                 .add_modifier(Modifier::DIM),
         );
     }
-    ta
-}
-
-fn make_textarea_with(text: String) -> TextArea<'static> {
-    let mut ta = TextArea::new(vec![text]);
-    ta.set_cursor_line_style(Style::default());
-    ta.set_placeholder_text("  ❯  message…  Shift+Enter for newline");
-    ta.set_placeholder_style(
-        Style::default()
-            .fg(Color::DarkGray)
-            .add_modifier(Modifier::DIM),
-    );
     ta
 }
 

@@ -2,6 +2,7 @@ pub mod edit_file;
 pub mod find_files;
 pub mod git_diff;
 pub mod git_status;
+mod glob;
 pub mod grep_search;
 pub mod list_directory;
 pub mod read_file;
