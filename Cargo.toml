@@ -1,0 +1,24 @@
+[package]
+name = "magai"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+clap = { version = "4.5.43", features = ["derive"] }
+crossterm = "0.29.0"
+futures = "0.3"
+ratatui = "0.30.0"
+rig = { version = "0.37.0", package = "rig-core", features = ["rmcp"] }
+serde = { version = "1.0.219", features = ["derive"] }
+toml = "0.8"
+serde_json = "1.0.149"
+tokio = { version = "1.49.0", features = ["full"] }
+tracing = "0.1.44"
+tracing-subscriber = "0.3.22"
+regex = "1"
+reqwest = "0.13"
+walkdir = "2"
+rmcp = { version = "1.7.0", features = ["client", "transport-child-process"] }
+uuid = { version = "1", features = ["v4"] }
+tui-markdown = "0.3.7"
+ratatui-textarea = "0.9.1"
