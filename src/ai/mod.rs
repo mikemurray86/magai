@@ -124,8 +124,8 @@ fn trim_history(history: &mut Vec<Message>, max_tokens: usize) -> usize {
     dropped
 }
 
-fn git_checkpoint() {
-    let _ = std::process::Command::new("git")
+fn git_checkpoint(ai_tx: &mpsc::UnboundedSender<AiEvent>) {
+    match std::process::Command::new("git")
         .args([
             "stash",
             "push",
@@ -133,7 +133,25 @@ fn git_checkpoint() {
             "-m",
             "magai-checkpoint",
         ])
-        .output();
+        .output()
+    {
+        Ok(out) if out.status.success() => {}
+        Ok(out) => {
+            let msg = String::from_utf8_lossy(&out.stderr).to_string();
+            ai_tx
+                .send(AiEvent::Error(format!(
+                    "checkpoint failed (undo will not work for this turn): {msg}"
+                )))
+                .ok();
+        }
+        Err(e) => {
+            ai_tx
+                .send(AiEvent::Error(format!(
+                    "checkpoint error (undo will not work for this turn): {e}"
+                )))
+                .ok();
+        }
+    }
 }
 
 fn git_undo(ai_tx: &mpsc::UnboundedSender<AiEvent>) {
@@ -336,7 +354,7 @@ pub async fn run_agent(
         };
 
         if in_git {
-            git_checkpoint();
+            git_checkpoint(&ai_tx);
         }
 
         let dropped = trim_history(&mut history, config.max_context_tokens);

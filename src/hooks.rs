@@ -49,8 +49,14 @@ impl HookRunner {
                 for (k, v) in &env {
                     cmd.env(k, v);
                 }
-                // spawn() starts the child without waiting; errors are silently ignored
-                let _ = cmd.spawn();
+                // spawn() starts the child without waiting (fire-and-forget)
+                if let Err(e) = cmd.spawn() {
+                    tracing::warn!(
+                        "hook for {} failed to spawn ({}): {e}",
+                        event.as_str(),
+                        hook.command
+                    );
+                }
             }
         }
     }

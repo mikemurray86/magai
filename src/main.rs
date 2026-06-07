@@ -21,7 +21,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let (user_tx, user_rx) = mpsc::unbounded_channel::<ai::AgentCommand>();
     let (ai_tx, ai_rx) = mpsc::unbounded_channel::<AiEvent>();
 
-    let cfg = config::Config::load();
+    let (cfg, config_warning) = config::Config::load();
+    if let Some(warning) = config_warning {
+        ai_tx
+            .send(AiEvent::Error(format!("config: {warning}")))
+            .ok();
+    }
     tokio::spawn(ai::run_agent(user_rx, ai_tx, cfg.clone()));
 
     let app = ui::App::new(user_tx, ai_rx, cfg);

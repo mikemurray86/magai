@@ -59,23 +59,29 @@ fn default_max_context_tokens() -> usize {
 }
 
 impl Config {
-    pub fn load() -> Self {
+    /// Loads the config, falling back to `Config::default()` on any read or
+    /// parse error. The second element of the tuple carries a human-readable
+    /// warning describing such a fallback, so the caller can surface it
+    /// somewhere visible (the TUI hides stderr, where this used to go).
+    pub fn load() -> (Self, Option<String>) {
         let Some(path) = config_path().filter(|p| p.exists()) else {
-            return Self::default();
+            return (Self::default(), None);
         };
         let src = match std::fs::read_to_string(&path) {
             Ok(s) => s,
             Err(e) => {
-                eprintln!("magai: could not read {:?}: {e}", path);
-                return Self::default();
+                return (
+                    Self::default(),
+                    Some(format!("could not read config {:?}: {e}", path)),
+                );
             }
         };
         match toml::from_str(&src) {
-            Ok(cfg) => cfg,
-            Err(e) => {
-                eprintln!("magai: config parse error in {:?}: {e}", path);
-                Self::default()
-            }
+            Ok(cfg) => (cfg, None),
+            Err(e) => (
+                Self::default(),
+                Some(format!("config parse error in {:?}: {e}", path)),
+            ),
         }
     }
 
