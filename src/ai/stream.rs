@@ -19,6 +19,10 @@ use super::AgentCommand;
 
 // ── unified stream item ───────────────────────────────────────────────────────
 
+/// A provider-agnostic streaming event, normalized from `rig`'s
+/// `MultiTurnStreamItem<R>` (whose `R` varies per provider/model) by
+/// `map_item` so `drive_stream` and the UI never need to match on
+/// provider-specific response types.
 pub(crate) enum OurItem {
     Text(String),
     History(Vec<Message>),
@@ -34,6 +38,8 @@ pub(crate) enum OurItem {
     },
 }
 
+/// A boxed stream of normalized items — the type `DynAgent::stream_chat`
+/// returns, regardless of which provider produced the underlying stream.
 pub(crate) type OurStream = Pin<Box<dyn Stream<Item = OurItem> + Send>>;
 
 pub(crate) fn map_item<R, E: std::fmt::Display>(
@@ -79,6 +85,8 @@ pub(crate) fn map_item<R, E: std::fmt::Display>(
 
 // ── stream driver ─────────────────────────────────────────────────────────────
 
+/// Outcome of `drive_stream`: whether the turn ran to completion or was
+/// interrupted mid-flight by an `AgentCommand::Cancel`.
 pub(crate) enum DriveResult {
     Done,
     Cancelled,

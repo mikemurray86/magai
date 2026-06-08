@@ -19,6 +19,11 @@ use super::stream::{map_item, OurStream};
 
 // ── type-erased agent ─────────────────────────────────────────────────────────
 
+/// A boxed, provider-agnostic streaming-chat closure: erases the concrete
+/// `rig::Agent<M>` type (and its model-specific completion/response types) so
+/// the rest of the code can hold "the current agent" without knowing which
+/// provider backs it. Built once per provider via `dyn_agent_from!` and
+/// rebuilt whenever the user switches models.
 pub(crate) struct DynAgent(
     Box<dyn Fn(String, Vec<Message>) -> BoxFuture<'static, OurStream> + Send + Sync>,
 );
