@@ -99,3 +99,46 @@ fn config_path() -> Option<PathBuf> {
         .ok()?;
     Some(base.join("magai").join("config.toml"))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::approval::PermissionMode;
+
+    const EXAMPLE: &str = include_str!("../docs/config.example.toml");
+
+    #[test]
+    fn parses_example_config() {
+        let cfg: Config = toml::from_str(EXAMPLE).expect("example config should parse");
+
+        assert_eq!(cfg.default_model.as_deref(), Some("local"));
+        assert_eq!(cfg.permission_mode, PermissionMode::AskDangerous);
+        assert_eq!(cfg.max_context_tokens, 80_000);
+
+        assert_eq!(cfg.providers.len(), 3);
+        let openai = cfg.providers.get("openai").expect("openai provider");
+        assert_eq!(openai.provider_type, ProviderType::OpenAI);
+        assert_eq!(openai.api_key_env.as_deref(), Some("OPENAI_API_KEY"));
+
+        assert_eq!(cfg.named_models.len(), 3);
+        let (nm, pc) = cfg.find_named_model("gpt4o").expect("gpt4o resolves");
+        assert_eq!(nm.model, "gpt-4o");
+        assert_eq!(pc.provider_type, ProviderType::OpenAI);
+    }
+
+    #[test]
+    fn malformed_toml_is_not_a_valid_config() {
+        let result: Result<Config, _> = toml::from_str("default_model = [this is not valid");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn empty_toml_uses_defaults() {
+        let cfg: Config = toml::from_str("").expect("empty config parses");
+        assert_eq!(cfg.named_models.len(), 0);
+        assert_eq!(cfg.providers.len(), 0);
+        assert_eq!(cfg.default_model, None);
+        assert_eq!(cfg.permission_mode, PermissionMode::AskDangerous);
+        assert_eq!(cfg.max_context_tokens, 80_000);
+    }
+}

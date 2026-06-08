@@ -1,61 +1,71 @@
 # magai configuration file
 # Location: ~/.config/magai/config.toml
 
-# ── Models ───────────────────────────────────────────────────────────────────
-#
-# Define one or more models. Each gets an alias used with /model <alias>.
-# Supported providers: ollama, openai, anthropic, groq, gemini
+# ── Top-level settings ───────────────────────────────────────────────────────
 
-[[models]]
-alias = "local"
-provider = "ollama"
-model = "granite4:latest"
-
-[[models]]
-alias = "gpt4o"
-provider = "openai"
-model = "gpt-4o"
-api_key_env = "OPENAI_API_KEY"
-
-[[models]]
-alias = "sonnet"
-provider = "anthropic"
-model = "claude-sonnet-4-5"
-api_key_env = "ANTHROPIC_API_KEY"
-
-# Use a custom base URL (e.g. a local OpenAI-compatible proxy)
-# [[models]]
-# alias = "proxy"
-# provider = "openai"
-# model = "mistral-7b"
-# api_key_env = "PROXY_API_KEY"
-# base_url = "http://localhost:8080/v1"
-
-
-# ── Default model ─────────────────────────────────────────────────────────────
-#
-# Which alias to use on startup. Falls back to "granite4:latest" via Ollama
-# if omitted or the alias is not found.
-
+# Which model alias to use on startup (must match a [[named_models]] entry
+# below). Falls back to "granite4:latest" via Ollama if omitted or not found.
 default_model = "local"
 
-
-# ── Permission mode ───────────────────────────────────────────────────────────
-#
 # Controls when magai asks before executing a tool call.
 #   ask-dangerous  — prompt only for write_file, edit_file, shell_command (default)
 #   ask-always     — prompt for every tool call
 #   auto           — never prompt; execute all tools silently
-
 permission_mode = "ask-dangerous"
 
-
-# ── Context window ────────────────────────────────────────────────────────────
-#
 # Rough token limit for conversation history (4 chars ≈ 1 token).
 # Older turns are trimmed automatically when this threshold is exceeded.
-
 max_context_tokens = 80000
+
+
+# ── Providers ─────────────────────────────────────────────────────────────────
+#
+# Each entry configures how to reach a backend. The key (e.g. "openai" below)
+# is referenced by `provider` in [[named_models]] entries.
+# Supported types: ollama, openai, anthropic, groq, gemini
+
+[providers.ollama]
+type = "ollama"
+
+[providers.openai]
+type = "openai"
+api_key_env = "OPENAI_API_KEY"
+
+[providers.anthropic]
+type = "anthropic"
+api_key_env = "ANTHROPIC_API_KEY"
+
+# Use a custom base URL (e.g. a local OpenAI-compatible proxy)
+# [providers.proxy]
+# type = "openai"
+# api_key_env = "PROXY_API_KEY"
+# base_url = "http://localhost:8080/v1"
+
+
+# ── Named models ──────────────────────────────────────────────────────────────
+#
+# Define one or more models. Each gets an alias used with /model <alias>.
+# `provider` must match a key from the [providers.*] tables above.
+
+[[named_models]]
+alias = "local"
+provider = "ollama"
+model = "granite4:latest"
+
+[[named_models]]
+alias = "gpt4o"
+provider = "openai"
+model = "gpt-4o"
+
+[[named_models]]
+alias = "sonnet"
+provider = "anthropic"
+model = "claude-sonnet-4-5"
+
+# [[named_models]]
+# alias = "proxy"
+# provider = "proxy"
+# model = "mistral-7b"
 
 
 # ── MCP servers ───────────────────────────────────────────────────────────────

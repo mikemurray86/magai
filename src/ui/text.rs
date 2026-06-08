@@ -210,3 +210,79 @@ pub(super) fn word_wrap(text: &str, max_width: usize) -> Vec<String> {
     }
     result
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ratatui::style::{Color, Modifier};
+
+    #[test]
+    fn word_wrap_breaks_at_width_boundary() {
+        assert_eq!(word_wrap("hello world", 5), vec!["hello", "world"]);
+        assert_eq!(word_wrap("hello world", 11), vec!["hello world"]);
+        assert_eq!(word_wrap("hello world", 100), vec!["hello world"]);
+    }
+
+    #[test]
+    fn word_wrap_hard_breaks_long_unbreakable_tokens() {
+        assert_eq!(
+            word_wrap("supercalifragilistic", 5),
+            vec!["super", "calif", "ragil", "istic"]
+        );
+    }
+
+    #[test]
+    fn word_wrap_preserves_blank_paragraphs() {
+        assert_eq!(
+            word_wrap("first\n\nsecond", 80),
+            vec!["first".to_string(), String::new(), "second".to_string()]
+        );
+    }
+
+    #[test]
+    fn word_wrap_zero_width_returns_text_unsplit() {
+        assert_eq!(word_wrap("hello world", 0), vec!["hello world"]);
+    }
+
+    #[test]
+    fn word_wrap_empty_text_yields_one_empty_line() {
+        assert_eq!(word_wrap("", 10), vec![String::new()]);
+    }
+
+    #[test]
+    fn floor_char_boundary_clamps_to_string_length() {
+        assert_eq!(floor_char_boundary("hello", 100), 5);
+        assert_eq!(floor_char_boundary("hello", 5), 5);
+    }
+
+    #[test]
+    fn floor_char_boundary_steps_back_out_of_multibyte_char() {
+        let s = "a→b"; // 'a' (1 byte) + '→' (U+2192, 3 bytes) + 'b' (1 byte)
+        assert_eq!(floor_char_boundary(s, 0), 0);
+        assert_eq!(floor_char_boundary(s, 1), 1); // boundary: start of '→'
+        assert_eq!(floor_char_boundary(s, 2), 1); // mid '→': floors back
+        assert_eq!(floor_char_boundary(s, 3), 1); // mid '→': floors back
+        assert_eq!(floor_char_boundary(s, 4), 4); // boundary: start of 'b'
+    }
+
+    #[test]
+    fn wrap_styled_line_splits_on_width_and_preserves_styles() {
+        let bold = Style::default().add_modifier(Modifier::BOLD);
+        let red = Style::default().fg(Color::Red);
+        let line = Line::from(vec![
+            Span::styled("hello", bold),
+            Span::raw(" "),
+            Span::styled("world", red),
+        ]);
+
+        let wrapped = wrap_styled_line(line, 5);
+        assert_eq!(wrapped.len(), 2);
+
+        let text =
+            |l: &Line<'static>| -> String { l.spans.iter().map(|s| s.content.as_ref()).collect() };
+        assert_eq!(text(&wrapped[0]), "hello");
+        assert_eq!(wrapped[0].spans[0].style, bold);
+        assert_eq!(text(&wrapped[1]), "world");
+        assert_eq!(wrapped[1].spans[0].style, red);
+    }
+}

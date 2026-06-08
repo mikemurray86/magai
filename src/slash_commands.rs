@@ -88,3 +88,126 @@ pub fn dispatch(input: &str, skills: &[crate::skills::Skill]) -> SlashCommandAct
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::skills::Skill;
+
+    fn skill(name: &str) -> Skill {
+        Skill {
+            name: name.to_string(),
+            description: format!("{name} description"),
+            content: format!("running {{{{args}}}} for {name}"),
+        }
+    }
+
+    #[test]
+    fn matching_commands_filters_by_prefix() {
+        let names: Vec<String> = matching_commands("/mod", &[])
+            .into_iter()
+            .map(|(n, _)| n)
+            .collect();
+        assert_eq!(names, vec!["/model".to_string()]);
+    }
+
+    #[test]
+    fn matching_commands_includes_skills() {
+        let skills = vec![skill("review"), skill("rename")];
+        let names: Vec<String> = matching_commands("/re", &skills)
+            .into_iter()
+            .map(|(n, _)| n)
+            .collect();
+        assert!(names.contains(&"/review".to_string()));
+        assert!(names.contains(&"/rename".to_string()));
+    }
+
+    #[test]
+    fn matching_commands_empty_prefix_matches_everything() {
+        let results = matching_commands("/", &[skill("foo")]);
+        assert_eq!(results.len(), COMMANDS.len() + 1);
+    }
+
+    #[test]
+    fn dispatch_exit_and_quit() {
+        assert!(matches!(dispatch("/exit", &[]), SlashCommandAction::Exit));
+        assert!(matches!(dispatch("/quit", &[]), SlashCommandAction::Exit));
+    }
+
+    #[test]
+    fn dispatch_simple_actions() {
+        assert!(matches!(dispatch("/clear", &[]), SlashCommandAction::Clear));
+        assert!(matches!(dispatch("/undo", &[]), SlashCommandAction::Undo));
+        assert!(matches!(
+            dispatch("/plugins", &[]),
+            SlashCommandAction::ShowPlugins
+        ));
+    }
+
+    #[test]
+    fn dispatch_model_with_and_without_arg() {
+        assert!(matches!(
+            dispatch("/model", &[]),
+            SlashCommandAction::ShowModel
+        ));
+        match dispatch("/model  gpt-4o ", &[]) {
+            SlashCommandAction::SetModel(m) => assert_eq!(m, "gpt-4o"),
+            _ => panic!("expected SetModel"),
+        }
+    }
+
+    #[test]
+    fn dispatch_provider_requires_arg() {
+        assert!(matches!(
+            dispatch("/provider", &[]),
+            SlashCommandAction::ShowMessage(_)
+        ));
+        match dispatch("/provider openai", &[]) {
+            SlashCommandAction::ListModels(p) => assert_eq!(p, "openai"),
+            _ => panic!("expected ListModels"),
+        }
+    }
+
+    #[test]
+    fn dispatch_tools_on_off_and_invalid() {
+        assert!(matches!(
+            dispatch("/tools on", &[]),
+            SlashCommandAction::SetTools(true)
+        ));
+        assert!(matches!(
+            dispatch("/tools off", &[]),
+            SlashCommandAction::SetTools(false)
+        ));
+        assert!(matches!(
+            dispatch("/tools maybe", &[]),
+            SlashCommandAction::ShowMessage(_)
+        ));
+    }
+
+    #[test]
+    fn dispatch_help_shows_message() {
+        assert!(matches!(
+            dispatch("/help", &[]),
+            SlashCommandAction::ShowMessage(_)
+        ));
+    }
+
+    #[test]
+    fn dispatch_runs_matching_skill_with_args() {
+        let skills = vec![skill("greet")];
+        match dispatch("/greet world", &skills) {
+            SlashCommandAction::RunSkill(rendered) => {
+                assert_eq!(rendered, "running world for greet");
+            }
+            _ => panic!("expected RunSkill"),
+        }
+    }
+
+    #[test]
+    fn dispatch_unknown_command() {
+        match dispatch("/bogus", &[]) {
+            SlashCommandAction::Unknown(msg) => assert!(msg.contains("/bogus")),
+            _ => panic!("expected Unknown"),
+        }
+    }
+}
