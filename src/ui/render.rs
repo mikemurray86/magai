@@ -263,6 +263,56 @@ impl App {
             }
         }
 
+        // ── dirty workspace prompt card ───────────────────
+        if self.pending_dirty_workspace {
+            let card_w = (area.width.saturating_sub(8)).min(58);
+            let card_h = 5_u16;
+            let card_x = (area.width.saturating_sub(card_w)) / 2;
+            let card_y = (area.height.saturating_sub(card_h)) / 2;
+            let card_rect = Rect::new(card_x, card_y, card_w, card_h);
+            let card_lines = vec![
+                Line::from(Span::styled(
+                    "  Working tree has uncommitted changes.",
+                    Style::default().fg(Color::Yellow),
+                )),
+                Line::raw(""),
+                Line::from(vec![
+                    Span::raw("  "),
+                    Span::styled(
+                        " s ",
+                        Style::default()
+                            .fg(Color::Black)
+                            .bg(Color::Green)
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                    Span::styled(" stash & enable undo    ", Style::default().fg(Color::Green)),
+                    Span::styled(
+                        " c ",
+                        Style::default()
+                            .fg(Color::Black)
+                            .bg(Color::Yellow)
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                    Span::styled(" continue without undo", Style::default().fg(Color::Yellow)),
+                ]),
+            ];
+            frame.render_widget(Clear, card_rect);
+            frame.render_widget(
+                Paragraph::new(card_lines).block(
+                    Block::new()
+                        .borders(Borders::ALL)
+                        .border_style(Style::default().fg(Color::Yellow))
+                        .title(Span::styled(
+                            " uncommitted changes ",
+                            Style::default()
+                                .fg(Color::Yellow)
+                                .add_modifier(Modifier::BOLD),
+                        )),
+                ),
+                card_rect,
+            );
+        }
+
         // ── approval card ─────────────────────────────────
         if let Some(ref approval) = self.pending_approval {
             let card_w = (area.width.saturating_sub(8)).min(60);

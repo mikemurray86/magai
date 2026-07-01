@@ -2,11 +2,13 @@ pub const COMMANDS: &[(&str, &str)] = &[
     ("/clear", "clear conversation history"),
     ("/exit", "quit the application"),
     ("/help", "show available commands"),
+    ("/memory", "search or manage persistent memory"),
     ("/model", "show or set the AI model"),
     ("/plugins", "list loaded plugins"),
     ("/provider", "list all models for a provider"),
+    ("/squash", "collapse checkpoint commits into one (optional message)"),
     ("/tools", "enable or disable tools (on/off)"),
-    ("/undo", "revert last agent changes via git stash pop"),
+    ("/undo", "revert last agent turn (git reset --hard HEAD~1)"),
     ("/quit", "quit the application"),
 ];
 
@@ -32,10 +34,13 @@ pub enum SlashCommandAction {
     SetTools(bool),
     Clear,
     Undo,
+    Squash(String),
     ListModels(String),
     ShowMessage(String),
     ShowPlugins,
     RunSkill(String),
+    MemorySearch(String),
+    MemoryClear,
     Unknown(String),
 }
 
@@ -48,6 +53,7 @@ pub fn dispatch(input: &str, skills: &[crate::skills::Skill]) -> SlashCommandAct
         "/exit" | "/quit" => SlashCommandAction::Exit,
         "/clear" => SlashCommandAction::Clear,
         "/undo" => SlashCommandAction::Undo,
+        "/squash" => SlashCommandAction::Squash(arg.to_string()),
         "/plugins" => SlashCommandAction::ShowPlugins,
         "/model" => {
             if arg.is_empty() {
@@ -68,14 +74,20 @@ pub fn dispatch(input: &str, skills: &[crate::skills::Skill]) -> SlashCommandAct
             "off" => SlashCommandAction::SetTools(false),
             _ => SlashCommandAction::ShowMessage("usage: /tools on|off".to_string()),
         },
+        "/memory" => match arg {
+            "clear" => SlashCommandAction::MemoryClear,
+            _ => SlashCommandAction::MemorySearch(arg.to_string()),
+        },
         "/help" => SlashCommandAction::ShowMessage(
             "/clear             —  clear conversation\n\
              /exit, /quit       —  quit the application\n\
              /help              —  show this message\n\
+             /memory [query]    —  search memory graph; /memory clear to wipe\n\
              /model [name]      —  show or set the AI model\n\
              /plugins           —  list loaded plugins\n\
+             /squash [message]  —  collapse checkpoint commits; commits if message given\n\
              /tools on|off      —  enable or disable tools\n\
-             /undo              —  revert last agent changes (git stash pop)"
+             /undo              —  revert last agent turn (git reset --hard HEAD~1)"
                 .to_string(),
         ),
         _ => {
@@ -200,6 +212,18 @@ mod tests {
                 assert_eq!(rendered, "running world for greet");
             }
             _ => panic!("expected RunSkill"),
+        }
+    }
+
+    #[test]
+    fn dispatch_squash_with_and_without_message() {
+        match dispatch("/squash feat: add login", &[]) {
+            SlashCommandAction::Squash(msg) => assert_eq!(msg, "feat: add login"),
+            _ => panic!("expected Squash"),
+        }
+        match dispatch("/squash", &[]) {
+            SlashCommandAction::Squash(msg) => assert_eq!(msg, ""),
+            _ => panic!("expected Squash"),
         }
     }
 

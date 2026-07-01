@@ -52,10 +52,49 @@ pub struct Config {
     pub max_context_tokens: usize,
     #[serde(default)]
     pub hooks: Vec<crate::hooks::HookConfig>,
+    #[serde(default)]
+    pub memory: MemoryConfig,
+    #[serde(default = "default_true")]
+    pub git_checkpointing: bool,
 }
 
 fn default_max_context_tokens() -> usize {
     80_000
+}
+
+fn default_true() -> bool {
+    true
+}
+
+fn default_memory_snippets() -> usize {
+    5
+}
+
+#[derive(Debug, Deserialize, Clone)]
+pub struct MemoryConfig {
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    #[serde(default = "default_true")]
+    pub inject_context: bool,
+    #[serde(default = "default_memory_snippets")]
+    pub max_context_snippets: usize,
+    pub db_path: Option<String>,
+    /// When set, enables LLM-based fact extraction after each turn using this
+    /// Ollama model name (e.g. "granite4:latest"). Disabled by default because
+    /// it adds a background HTTP call per turn.
+    pub extract_facts_model: Option<String>,
+}
+
+impl Default for MemoryConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            inject_context: true,
+            max_context_snippets: default_memory_snippets(),
+            db_path: None,
+            extract_facts_model: None,
+        }
+    }
 }
 
 impl Config {

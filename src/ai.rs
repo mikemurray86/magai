@@ -17,6 +17,7 @@ use tokio::sync::mpsc;
 use crate::approval::{ApprovalGate, GatedTool, PermissionMode};
 use crate::config::{Config, ProviderType};
 use crate::hooks::{HookEvent, HookRunner};
+use crate::memory::{default_db_path, MemoryDb, ToolCallRecord};
 use crate::ui::AiEvent;
 
 use providers::{
@@ -39,6 +40,8 @@ pub enum AgentCommand {
     Cancel,
     Clear,
     Undo,
+    Squash(String),
+    DirtyWorkspaceResponse(bool),
     ListModels(String),
     UseProviderModel {
         provider_alias: String,
@@ -124,31 +127,42 @@ fn trim_history(history: &mut Vec<Message>, max_tokens: usize) -> usize {
     dropped
 }
 
-fn git_checkpoint(ai_tx: &mpsc::UnboundedSender<AiEvent>) {
+fn git_is_dirty() -> bool {
+    std::process::Command::new("git")
+        .args(["status", "--porcelain"])
+        .output()
+        .map(|out| !out.stdout.is_empty())
+        .unwrap_or(false)
+}
+
+fn git_commit_checkpoint(ai_tx: &mpsc::UnboundedSender<AiEvent>) {
+    let _ = std::process::Command::new("git")
+        .args(["add", "-A"])
+        .output();
+    let has_staged = std::process::Command::new("git")
+        .args(["diff", "--cached", "--quiet"])
+        .status()
+        .map(|s| !s.success())
+        .unwrap_or(false);
+    if !has_staged {
+        return;
+    }
     match std::process::Command::new("git")
-        .args([
-            "stash",
-            "push",
-            "--include-untracked",
-            "-m",
-            "magai-checkpoint",
-        ])
+        .args(["commit", "-m", "magai-checkpoint"])
         .output()
     {
         Ok(out) if out.status.success() => {}
         Ok(out) => {
-            let msg = String::from_utf8_lossy(&out.stderr).to_string();
             ai_tx
                 .send(AiEvent::Error(format!(
-                    "checkpoint failed (undo will not work for this turn): {msg}"
+                    "checkpoint failed (undo unavailable this turn): {}",
+                    String::from_utf8_lossy(&out.stderr)
                 )))
                 .ok();
         }
         Err(e) => {
             ai_tx
-                .send(AiEvent::Error(format!(
-                    "checkpoint error (undo will not work for this turn): {e}"
-                )))
+                .send(AiEvent::Error(format!("checkpoint error: {e}")))
                 .ok();
         }
     }
@@ -156,7 +170,7 @@ fn git_checkpoint(ai_tx: &mpsc::UnboundedSender<AiEvent>) {
 
 fn git_undo(ai_tx: &mpsc::UnboundedSender<AiEvent>) {
     match std::process::Command::new("git")
-        .args(["stash", "pop"])
+        .args(["reset", "--hard", "HEAD~1"])
         .output()
     {
         Ok(out) if out.status.success() => {
@@ -165,9 +179,11 @@ fn git_undo(ai_tx: &mpsc::UnboundedSender<AiEvent>) {
                 .ok();
         }
         Ok(out) => {
-            let msg = String::from_utf8_lossy(&out.stderr).to_string();
             ai_tx
-                .send(AiEvent::Error(format!("undo failed: {msg}")))
+                .send(AiEvent::Error(format!(
+                    "undo failed: {}",
+                    String::from_utf8_lossy(&out.stderr)
+                )))
                 .ok();
         }
         Err(e) => {
@@ -176,8 +192,88 @@ fn git_undo(ai_tx: &mpsc::UnboundedSender<AiEvent>) {
     }
 }
 
+fn git_squash(start_sha: &str, message: &str, ai_tx: &mpsc::UnboundedSender<AiEvent>) {
+    match std::process::Command::new("git")
+        .args(["reset", "--soft", start_sha])
+        .output()
+    {
+        Ok(out) if !out.status.success() => {
+            ai_tx
+                .send(AiEvent::Error(format!(
+                    "squash reset failed: {}",
+                    String::from_utf8_lossy(&out.stderr)
+                )))
+                .ok();
+            return;
+        }
+        Err(e) => {
+            ai_tx
+                .send(AiEvent::Error(format!("squash reset error: {e}")))
+                .ok();
+            return;
+        }
+        _ => {}
+    }
+    if message.is_empty() {
+        ai_tx
+            .send(AiEvent::Error(
+                "squash: checkpoint commits collapsed — staged changes ready to commit".into(),
+            ))
+            .ok();
+        return;
+    }
+    match std::process::Command::new("git")
+        .args(["commit", "-m", message])
+        .output()
+    {
+        Ok(out) if out.status.success() => {
+            ai_tx
+                .send(AiEvent::Error(format!(
+                    "squash: committed as \"{message}\""
+                )))
+                .ok();
+        }
+        Ok(out) => {
+            ai_tx
+                .send(AiEvent::Error(format!(
+                    "squash commit failed: {}",
+                    String::from_utf8_lossy(&out.stderr)
+                )))
+                .ok();
+        }
+        Err(e) => {
+            ai_tx
+                .send(AiEvent::Error(format!("squash commit error: {e}")))
+                .ok();
+        }
+    }
+}
+
 fn is_git_repo() -> bool {
     std::path::Path::new(".git").exists()
+}
+
+fn extract_final_assistant_text(history: &[Message]) -> String {
+    use rig::message::AssistantContent;
+    history
+        .iter()
+        .rev()
+        .find_map(|msg| {
+            if let Message::Assistant { content, .. } = msg {
+                let text: String = content
+                    .iter()
+                    .filter_map(|c| match c {
+                        AssistantContent::Text(t) => Some(t.text.as_str()),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>()
+                    .join("");
+                (!text.is_empty()).then_some(text)
+            } else {
+                None
+            }
+        })
+        .unwrap_or_default()
 }
 
 // ── agent task ────────────────────────────────────────────────────────────────
@@ -212,6 +308,55 @@ pub async fn run_agent(
         .cloned()
         .collect();
     let _mcp_services = crate::mcp::connect_servers(&all_mcp, tool_handle.clone()).await;
+
+    // ── memory ────────────────────────────────────────────────────────────────
+    let memory_db: Option<Arc<MemoryDb>> = if config.memory.enabled {
+        let path = config
+            .memory
+            .db_path
+            .as_ref()
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(default_db_path);
+        match MemoryDb::open(&path) {
+            Ok(db) => {
+                let db = Arc::new(db);
+                tool_handle
+                    .add_tool(GatedTool::new(
+                        crate::tools::MemoryQuery::new(db.clone()),
+                        false,
+                        mode,
+                        gate.clone(),
+                        ai_tx.clone(),
+                        hook_runner.clone(),
+                    ))
+                    .await
+                    .ok();
+                tool_handle
+                    .add_tool(GatedTool::new(
+                        crate::tools::MemorySave::new(
+                            db.clone(),
+                            config.default_model.as_deref().unwrap_or(DEFAULT_MODEL).to_string(),
+                        ),
+                        false,
+                        mode,
+                        gate.clone(),
+                        ai_tx.clone(),
+                        hook_runner.clone(),
+                    ))
+                    .await
+                    .ok();
+                Some(db)
+            }
+            Err(e) => {
+                ai_tx
+                    .send(AiEvent::Error(format!("memory: could not open db: {e}")))
+                    .ok();
+                None
+            }
+        }
+    } else {
+        None
+    };
 
     let project_ctx = read_project_instructions();
     let preamble = build_preamble(&project_ctx);
@@ -250,7 +395,52 @@ pub async fn run_agent(
 
     let mut history: Vec<Message> = Vec::new();
     let mut tool_timings: HashMap<String, Instant> = HashMap::new();
+
     let in_git = is_git_repo();
+    let checkpointing_configured = in_git && config.git_checkpointing;
+
+    let session_start_sha: Option<String> = if checkpointing_configured {
+        std::process::Command::new("git")
+            .args(["rev-parse", "HEAD"])
+            .output()
+            .ok()
+            .and_then(|o| {
+                o.status
+                    .success()
+                    .then(|| String::from_utf8_lossy(&o.stdout).trim().to_string())
+            })
+    } else {
+        None
+    };
+
+    let checkpoint_enabled = if checkpointing_configured && git_is_dirty() {
+        ai_tx.send(AiEvent::DirtyWorkspacePrompt).ok();
+        let mut enabled = false;
+        loop {
+            match user_rx.recv().await {
+                Some(AgentCommand::DirtyWorkspaceResponse(stash)) => {
+                    if stash {
+                        let _ = std::process::Command::new("git")
+                            .args([
+                                "stash",
+                                "push",
+                                "--include-untracked",
+                                "-m",
+                                "magai-user-stash",
+                            ])
+                            .output();
+                        enabled = true;
+                    }
+                    break;
+                }
+                None => return,
+                _ => {}
+            }
+        }
+        enabled
+    } else {
+        checkpointing_configured
+    };
 
     while let Some(cmd) = user_rx.recv().await {
         let message = match cmd {
@@ -282,9 +472,45 @@ pub async fn run_agent(
                 continue;
             }
             AgentCommand::Undo => {
-                git_undo(&ai_tx);
+                if checkpoint_enabled {
+                    git_undo(&ai_tx);
+                } else if !in_git {
+                    ai_tx
+                        .send(AiEvent::Error(
+                            "undo is not available (not a git repository)".into(),
+                        ))
+                        .ok();
+                } else {
+                    ai_tx
+                        .send(AiEvent::Error(
+                            "undo is not available (session started with uncommitted changes)"
+                                .into(),
+                        ))
+                        .ok();
+                }
                 continue;
             }
+            AgentCommand::Squash(message) => {
+                if let Some(ref sha) = session_start_sha {
+                    if checkpoint_enabled {
+                        git_squash(sha, &message, &ai_tx);
+                    } else {
+                        ai_tx
+                            .send(AiEvent::Error(
+                                "squash is not available (checkpointing disabled)".into(),
+                            ))
+                            .ok();
+                    }
+                } else {
+                    ai_tx
+                        .send(AiEvent::Error(
+                            "squash is not available (not a git repository)".into(),
+                        ))
+                        .ok();
+                }
+                continue;
+            }
+            AgentCommand::DirtyWorkspaceResponse(_) => continue,
             AgentCommand::ListModels(alias) => {
                 let ai_tx2 = ai_tx.clone();
                 let config2 = config.clone();
@@ -353,9 +579,26 @@ pub async fn run_agent(
             AgentCommand::Message(msg) => msg,
         };
 
-        if in_git {
-            git_checkpoint(&ai_tx);
-        }
+        // Pre-turn: prepend relevant memory context so the model has cross-session recall.
+        let message = if let (Some(db), true) = (&memory_db, config.memory.inject_context) {
+            let snippets = crate::memory::retrieval::query_relevant(
+                db,
+                &message,
+                config.memory.max_context_snippets,
+            );
+            if !snippets.is_empty() {
+                let ctx = snippets
+                    .iter()
+                    .map(|s| format!("- {}: {}", s.kind, s.name))
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                format!("Context from memory:\n{ctx}\n\n---\n\n{message}")
+            } else {
+                message
+            }
+        } else {
+            message
+        };
 
         let dropped = trim_history(&mut history, config.max_context_tokens);
         if dropped > 0 {
@@ -372,6 +615,7 @@ pub async fn run_agent(
 
         let taken = std::mem::take(&mut history);
         let stream = agent.stream_chat(message, taken).await;
+        let mut tool_records: Vec<ToolCallRecord> = Vec::new();
         let result = drive_stream(
             stream,
             &ai_tx,
@@ -379,10 +623,34 @@ pub async fn run_agent(
             &mut history,
             &gate,
             &mut tool_timings,
+            &mut tool_records,
         )
         .await;
 
+        // Post-turn: persist entities extracted from tool calls.
+        if let Some(db) = &memory_db {
+            crate::memory::extract::process_turn(db, &current_model, &tool_records);
+
+            // LLM-based fact extraction — fire-and-forget, opt-in via config.
+            if let Some(model) = config.memory.extract_facts_model.clone() {
+                let text = extract_final_assistant_text(&history);
+                if !text.is_empty() {
+                    let db = Arc::clone(db);
+                    let alias = current_model.clone();
+                    tokio::spawn(crate::memory::extract::extract_facts_async(
+                        db,
+                        text,
+                        model,
+                        alias,
+                    ));
+                }
+            }
+        }
+
         if matches!(result, DriveResult::Done) {
+            if checkpoint_enabled {
+                git_commit_checkpoint(&ai_tx);
+            }
             hook_runner.fire(
                 HookEvent::AgentResponse,
                 HashMap::from([("MAGAI_MODEL".to_string(), current_model.clone())]),

@@ -1,5 +1,6 @@
 mod ai;
 mod approval;
+mod memory;
 mod config;
 mod hooks;
 mod mcp;

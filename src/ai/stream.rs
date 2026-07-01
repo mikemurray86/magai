@@ -13,6 +13,7 @@ use rig::streaming::{StreamedAssistantContent, StreamedUserContent};
 use tokio::sync::mpsc;
 
 use crate::approval::ApprovalGate;
+use crate::memory::ToolCallRecord;
 use crate::ui::AiEvent;
 
 use super::AgentCommand;
@@ -99,7 +100,10 @@ pub(crate) async fn drive_stream(
     history: &mut Vec<Message>,
     gate: &ApprovalGate,
     tool_timings: &mut HashMap<String, Instant>,
+    tool_records: &mut Vec<ToolCallRecord>,
 ) -> DriveResult {
+    // Buffers (name, args_json) for in-flight calls awaiting their result.
+    let mut pending: HashMap<String, (String, String)> = HashMap::new();
     loop {
         tokio::select! {
             item = stream.next() => {
@@ -115,6 +119,7 @@ pub(crate) async fn drive_stream(
                     }
                     Some(OurItem::ToolCallStart { call_id, name, args_json }) => {
                         tool_timings.insert(call_id.clone(), Instant::now());
+                        pending.insert(call_id.clone(), (name.clone(), args_json.clone()));
                         ai_tx.send(AiEvent::ToolCallStart {
                             call_id,
                             name,
@@ -125,6 +130,13 @@ pub(crate) async fn drive_stream(
                         let elapsed_ms = tool_timings.remove(&call_id)
                             .map(|t| t.elapsed().as_millis() as u64)
                             .unwrap_or(0);
+                        if let Some((name, args_json)) = pending.remove(&call_id) {
+                            tool_records.push(ToolCallRecord {
+                                name,
+                                args_json,
+                                result: result.clone(),
+                            });
+                        }
                         ai_tx.send(AiEvent::ToolCallResult { call_id, result, elapsed_ms }).ok();
                     }
                     Some(OurItem::History(h)) => {

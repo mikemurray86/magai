@@ -45,6 +45,7 @@ pub enum AiEvent {
         turns_dropped: usize,
     },
     HistoryCleared,
+    DirtyWorkspacePrompt,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -98,6 +99,7 @@ pub struct App {
     provider_ac_idx: Option<usize>,
     provider_models: Option<(String, Vec<String>)>,
     provider_model_sel: usize,
+    pending_dirty_workspace: bool,
 }
 
 impl App {
@@ -139,6 +141,7 @@ impl App {
             provider_ac_idx: None,
             provider_models: None,
             provider_model_sel: 0,
+            pending_dirty_workspace: false,
         }
     }
 
@@ -267,6 +270,9 @@ impl App {
                     self.provider_model_sel = 0;
                     self.textarea = make_textarea("", false);
                     self.model_ac_idx = None;
+                }
+                AiEvent::DirtyWorkspacePrompt => {
+                    self.pending_dirty_workspace = true;
                 }
             }
         }

@@ -7,6 +7,50 @@ use std::time::Duration;
 
 use super::{make_textarea, App, ChatMessage, Role};
 
+fn memory_db_for(config: &crate::config::Config) -> Option<crate::memory::MemoryDb> {
+    if !config.memory.enabled {
+        return None;
+    }
+    let path = config
+        .memory
+        .db_path
+        .as_ref()
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(crate::memory::default_db_path);
+    crate::memory::MemoryDb::open(&path).ok()
+}
+
+fn memory_search(config: &crate::config::Config, query: &str) -> String {
+    let Some(db) = memory_db_for(config) else {
+        return "memory is disabled".to_string();
+    };
+    if query.is_empty() {
+        let lines = crate::memory::retrieval::recent_nodes(&db, 15);
+        if lines.is_empty() {
+            "memory is empty".to_string()
+        } else {
+            format!("Recent memory:\n{}", lines.join("\n"))
+        }
+    } else {
+        let lines = crate::memory::retrieval::query_with_neighbors(&db, query, 10);
+        if lines.is_empty() {
+            format!("no memory entries matching \"{query}\"")
+        } else {
+            lines.join("\n")
+        }
+    }
+}
+
+fn memory_clear(config: &crate::config::Config) -> String {
+    let Some(db) = memory_db_for(config) else {
+        return "memory is disabled".to_string();
+    };
+    match crate::memory::retrieval::clear_all(&db) {
+        Ok(()) => "memory cleared".to_string(),
+        Err(e) => format!("memory clear failed: {e}"),
+    }
+}
+
 impl App {
     fn handle_slash_command(&mut self, input: &str) {
         use crate::slash_commands::{dispatch, SlashCommandAction};
@@ -33,6 +77,11 @@ impl App {
             }
             SlashCommandAction::Undo => {
                 self.user_tx.send(crate::ai::AgentCommand::Undo).ok();
+            }
+            SlashCommandAction::Squash(message) => {
+                self.user_tx
+                    .send(crate::ai::AgentCommand::Squash(message))
+                    .ok();
             }
             SlashCommandAction::ShowModel => {
                 self.push_system(format!("current model: {}", self.current_model));
@@ -67,6 +116,14 @@ impl App {
             }
             SlashCommandAction::ShowPlugins => {
                 self.push_system(crate::plugins::summary(&self.plugins));
+            }
+            SlashCommandAction::MemorySearch(query) => {
+                let msg = memory_search(&self.config, &query);
+                self.push_system(msg);
+            }
+            SlashCommandAction::MemoryClear => {
+                let msg = memory_clear(&self.config);
+                self.push_system(msg);
             }
             SlashCommandAction::ShowMessage(msg) | SlashCommandAction::Unknown(msg) => {
                 self.push_system(msg);
@@ -131,6 +188,26 @@ impl App {
                 }
                 Event::Key(key) => {
                     if key.kind != KeyEventKind::Press {
+                        return Ok(());
+                    }
+
+                    // Dirty workspace prompt intercepts s/c exclusively
+                    if self.pending_dirty_workspace {
+                        match key.code {
+                            KeyCode::Char('s') | KeyCode::Char('S') => {
+                                self.user_tx
+                                    .send(crate::ai::AgentCommand::DirtyWorkspaceResponse(true))
+                                    .ok();
+                                self.pending_dirty_workspace = false;
+                            }
+                            KeyCode::Char('c') | KeyCode::Char('C') => {
+                                self.user_tx
+                                    .send(crate::ai::AgentCommand::DirtyWorkspaceResponse(false))
+                                    .ok();
+                                self.pending_dirty_workspace = false;
+                            }
+                            _ => {}
+                        }
                         return Ok(());
                     }
 
