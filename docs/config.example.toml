@@ -17,6 +17,10 @@ permission_mode = "ask-dangerous"
 # Older turns are trimmed automatically when this threshold is exceeded.
 max_context_tokens = 80000
 
+# Max number of turns (model replies + tool round-trips) the agent may take
+# per user message before pausing to ask whether to continue. Default: 25.
+max_turns = 25
+
 
 # ── Providers ─────────────────────────────────────────────────────────────────
 #

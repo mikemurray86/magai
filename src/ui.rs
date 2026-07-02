@@ -46,6 +46,9 @@ pub enum AiEvent {
     },
     HistoryCleared,
     DirtyWorkspacePrompt,
+    MaxTurnsReached {
+        max_turns: usize,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -100,6 +103,8 @@ pub struct App {
     provider_models: Option<(String, Vec<String>)>,
     provider_model_sel: usize,
     pending_dirty_workspace: bool,
+    pending_max_turns: Option<usize>,
+    max_turns_input: String,
 }
 
 impl App {
@@ -142,6 +147,8 @@ impl App {
             provider_models: None,
             provider_model_sel: 0,
             pending_dirty_workspace: false,
+            pending_max_turns: None,
+            max_turns_input: String::new(),
         }
     }
 
@@ -273,6 +280,12 @@ impl App {
                 }
                 AiEvent::DirtyWorkspacePrompt => {
                     self.pending_dirty_workspace = true;
+                }
+                AiEvent::MaxTurnsReached { max_turns } => {
+                    self.is_waiting = false;
+                    self.pending_max_turns = Some(max_turns);
+                    self.max_turns_input.clear();
+                    self.auto_scroll = true;
                 }
             }
         }

@@ -140,18 +140,14 @@ pub fn recent_nodes(db: &MemoryDb, limit: usize) -> Vec<String> {
 /// Wipes all memory graph data.
 pub fn clear_all(db: &MemoryDb) -> rusqlite::Result<()> {
     db.with(|conn| {
-        conn.execute_batch(
-            "DELETE FROM nodes_fts; DELETE FROM edges; DELETE FROM nodes;",
-        )
+        conn.execute_batch("DELETE FROM nodes_fts; DELETE FROM edges; DELETE FROM nodes;")
     })
 }
 
 fn build_fts_query(text: &str) -> String {
     let tokens: Vec<String> = text
         .split_whitespace()
-        .filter(|w| {
-            w.len() >= 3 && w.chars().all(|c| c.is_alphanumeric() || "._/-".contains(c))
-        })
+        .filter(|w| w.len() >= 3 && w.chars().all(|c| c.is_alphanumeric() || "._/-".contains(c)))
         .take(8)
         .map(|w| format!("\"{}\"", w.replace('"', "")))
         .collect();

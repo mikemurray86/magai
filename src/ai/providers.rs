@@ -25,12 +25,24 @@ use super::stream::{map_item, OurStream};
 /// provider backs it. Built once per provider via `dyn_agent_from!` and
 /// rebuilt whenever the user switches models.
 pub(crate) struct DynAgent(
-    Box<dyn Fn(String, Vec<Message>) -> BoxFuture<'static, OurStream> + Send + Sync>,
+    Box<dyn Fn(Message, Vec<Message>, usize) -> BoxFuture<'static, OurStream> + Send + Sync>,
 );
 
 impl DynAgent {
-    pub(crate) async fn stream_chat(&self, msg: String, hist: Vec<Message>) -> OurStream {
-        (self.0)(msg, hist).await
+    /// `max_turns` is a per-call cap (via rig's `.multi_turn()`), not an
+    /// agent-build-time setting: `AgentBuilder::default_max_turns` does not
+    /// apply to the `StreamingChat` shorthand this wraps — a fresh
+    /// `StreamingPromptRequest` always starts its own cap at 0 regardless of
+    /// how the agent was built, so every call must set it explicitly. This
+    /// also means resuming after `MaxTurnsReached` needs no agent rebuild —
+    /// just a fresh call with a different `max_turns`.
+    pub(crate) async fn stream_chat(
+        &self,
+        msg: impl Into<Message>,
+        hist: Vec<Message>,
+        max_turns: usize,
+    ) -> OurStream {
+        (self.0)(msg.into(), hist, max_turns).await
     }
 }
 
@@ -44,10 +56,10 @@ impl DynAgent {
 macro_rules! dyn_agent_from {
     ($agent:expr) => {{
         let agent = Arc::new($agent);
-        DynAgent(Box::new(move |msg, hist| {
+        DynAgent(Box::new(move |msg, hist, max_turns| {
             let agent = Arc::clone(&agent);
             Box::pin(async move {
-                let raw = agent.stream_chat(msg, hist).await;
+                let raw = agent.stream_chat(msg, hist).multi_turn(max_turns).await;
                 Box::pin(raw.filter_map(|item| async move { map_item(item) })) as OurStream
             })
         }))

@@ -1,9 +1,9 @@
 mod ai;
 mod approval;
-mod memory;
 mod config;
 mod hooks;
 mod mcp;
+mod memory;
 mod plugins;
 mod skills;
 mod slash_commands;

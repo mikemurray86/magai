@@ -1,7 +1,7 @@
-mod schema;
 pub mod extract;
 pub mod graph;
 pub mod retrieval;
+mod schema;
 
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;

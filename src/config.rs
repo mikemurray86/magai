@@ -50,6 +50,8 @@ pub struct Config {
     pub permission_mode: crate::approval::PermissionMode,
     #[serde(default = "default_max_context_tokens")]
     pub max_context_tokens: usize,
+    #[serde(default = "default_max_turns")]
+    pub max_turns: usize,
     #[serde(default)]
     pub hooks: Vec<crate::hooks::HookConfig>,
     #[serde(default)]
@@ -60,6 +62,14 @@ pub struct Config {
 
 fn default_max_context_tokens() -> usize {
     80_000
+}
+
+/// How many rig "turns" (model replies + tool round-trips) an agent may take
+/// per user message before rig aborts the stream with `MaxTurnsError`. Rig's
+/// own default (unset) is effectively ~1, far too low for a tool-calling
+/// coding agent, so magai always sets an explicit cap.
+fn default_max_turns() -> usize {
+    25
 }
 
 fn default_true() -> bool {
@@ -153,6 +163,7 @@ mod tests {
         assert_eq!(cfg.default_model.as_deref(), Some("local"));
         assert_eq!(cfg.permission_mode, PermissionMode::AskDangerous);
         assert_eq!(cfg.max_context_tokens, 80_000);
+        assert_eq!(cfg.max_turns, 25);
 
         assert_eq!(cfg.providers.len(), 3);
         let openai = cfg.providers.get("openai").expect("openai provider");
@@ -179,5 +190,6 @@ mod tests {
         assert_eq!(cfg.default_model, None);
         assert_eq!(cfg.permission_mode, PermissionMode::AskDangerous);
         assert_eq!(cfg.max_context_tokens, 80_000);
+        assert_eq!(cfg.max_turns, 25);
     }
 }

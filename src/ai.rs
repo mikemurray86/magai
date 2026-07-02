@@ -22,6 +22,7 @@ use crate::ui::AiEvent;
 
 use providers::{
     api_key_from_env, build_anthropic, build_ollama, build_openai, fetch_models, resolve_agent,
+    DynAgent,
 };
 use stream::{drive_stream, DriveResult};
 
@@ -42,6 +43,9 @@ pub enum AgentCommand {
     Undo,
     Squash(String),
     DirtyWorkspaceResponse(bool),
+    /// Response to `AiEvent::MaxTurnsReached`: `Some(n)` continues the
+    /// paused turn for `n` more turns, `None` declines and ends the turn.
+    MaxTurnsResponse(Option<usize>),
     ListModels(String),
     UseProviderModel {
         provider_alias: String,
@@ -276,6 +280,92 @@ fn extract_final_assistant_text(history: &[Message]) -> String {
         .unwrap_or_default()
 }
 
+/// Sends `ResponseStart`, streams `prompt` against `history` (which is taken
+/// and replaced in place, same as `OurItem::History`/`MaxTurnsReached`
+/// handling inside `drive_stream`), and returns the outcome plus whatever
+/// tool calls were recorded. Shared by the fresh-message path and the
+/// max-turns continuation path so both get identical stream-driving.
+#[allow(clippy::too_many_arguments)]
+async fn drive_turn(
+    agent: &DynAgent,
+    prompt: impl Into<Message>,
+    history: &mut Vec<Message>,
+    ai_tx: &mpsc::UnboundedSender<AiEvent>,
+    user_rx: &mut mpsc::UnboundedReceiver<AgentCommand>,
+    gate: &ApprovalGate,
+    tool_timings: &mut HashMap<String, Instant>,
+    current_model: &str,
+    max_turns: usize,
+) -> (DriveResult, Vec<ToolCallRecord>) {
+    ai_tx
+        .send(AiEvent::ResponseStart(current_model.to_string()))
+        .ok();
+    let taken = std::mem::take(history);
+    let stream = agent.stream_chat(prompt, taken, max_turns).await;
+    let mut tool_records: Vec<ToolCallRecord> = Vec::new();
+    let result = drive_stream(
+        stream,
+        ai_tx,
+        user_rx,
+        history,
+        gate,
+        tool_timings,
+        &mut tool_records,
+    )
+    .await;
+    (result, tool_records)
+}
+
+/// Post-turn bookkeeping shared by every path that finishes driving a turn:
+/// memory extraction, and — depending on outcome — either the checkpoint
+/// commit + `AgentResponse` hook (`Done`) or stashing the resume prompt for
+/// the next `MaxTurnsResponse` (`MaxTurnsReached`).
+#[allow(clippy::too_many_arguments)]
+fn finish_turn(
+    result: DriveResult,
+    tool_records: &[ToolCallRecord],
+    history: &[Message],
+    pending_resume: &mut Option<Message>,
+    memory_db: &Option<Arc<MemoryDb>>,
+    config: &Config,
+    current_model: &str,
+    checkpoint_enabled: bool,
+    ai_tx: &mpsc::UnboundedSender<AiEvent>,
+    hook_runner: &HookRunner,
+) {
+    if let Some(db) = memory_db {
+        crate::memory::extract::process_turn(db, current_model, tool_records);
+
+        // LLM-based fact extraction — fire-and-forget, opt-in via config.
+        if let Some(model) = config.memory.extract_facts_model.clone() {
+            let text = extract_final_assistant_text(history);
+            if !text.is_empty() {
+                let db = Arc::clone(db);
+                let alias = current_model.to_string();
+                tokio::spawn(crate::memory::extract::extract_facts_async(
+                    db, text, model, alias,
+                ));
+            }
+        }
+    }
+
+    match result {
+        DriveResult::Done => {
+            if checkpoint_enabled {
+                git_commit_checkpoint(ai_tx);
+            }
+            hook_runner.fire(
+                HookEvent::AgentResponse,
+                HashMap::from([("MAGAI_MODEL".to_string(), current_model.to_string())]),
+            );
+        }
+        DriveResult::MaxTurnsReached { pending_prompt } => {
+            *pending_resume = Some(*pending_prompt);
+        }
+        DriveResult::Cancelled => {}
+    }
+}
+
 // ── agent task ────────────────────────────────────────────────────────────────
 
 pub async fn run_agent(
@@ -335,7 +425,11 @@ pub async fn run_agent(
                     .add_tool(GatedTool::new(
                         crate::tools::MemorySave::new(
                             db.clone(),
-                            config.default_model.as_deref().unwrap_or(DEFAULT_MODEL).to_string(),
+                            config
+                                .default_model
+                                .as_deref()
+                                .unwrap_or(DEFAULT_MODEL)
+                                .to_string(),
                         ),
                         false,
                         mode,
@@ -395,6 +489,9 @@ pub async fn run_agent(
 
     let mut history: Vec<Message> = Vec::new();
     let mut tool_timings: HashMap<String, Instant> = HashMap::new();
+    // Set when a turn is paused on `AiEvent::MaxTurnsReached`; holds the
+    // still-unsent prompt so `MaxTurnsResponse` can resume or discard it.
+    let mut pending_resume: Option<Message> = None;
 
     let in_git = is_git_repo();
     let checkpointing_configured = in_git && config.git_checkpointing;
@@ -511,6 +608,58 @@ pub async fn run_agent(
                 continue;
             }
             AgentCommand::DirtyWorkspaceResponse(_) => continue,
+            AgentCommand::MaxTurnsResponse(resp) => {
+                let Some(prompt) = pending_resume.take() else {
+                    continue;
+                };
+                match resp {
+                    None => {
+                        history.push(prompt);
+                        finish_turn(
+                            DriveResult::Done,
+                            &[],
+                            &history,
+                            &mut pending_resume,
+                            &memory_db,
+                            &config,
+                            &current_model,
+                            checkpoint_enabled,
+                            &ai_tx,
+                            &hook_runner,
+                        );
+                    }
+                    Some(n) => {
+                        // No agent rebuild needed: `max_turns` is a per-call
+                        // `.multi_turn()` cap on the request, not a property
+                        // baked into the agent at build time.
+                        let (result, tool_records) = drive_turn(
+                            &agent,
+                            prompt,
+                            &mut history,
+                            &ai_tx,
+                            &mut user_rx,
+                            &gate,
+                            &mut tool_timings,
+                            &current_model,
+                            n,
+                        )
+                        .await;
+                        finish_turn(
+                            result,
+                            &tool_records,
+                            &history,
+                            &mut pending_resume,
+                            &memory_db,
+                            &config,
+                            &current_model,
+                            checkpoint_enabled,
+                            &ai_tx,
+                            &hook_runner,
+                        );
+                    }
+                }
+                continue;
+            }
             AgentCommand::ListModels(alias) => {
                 let ai_tx2 = ai_tx.clone();
                 let config2 = config.clone();
@@ -579,6 +728,13 @@ pub async fn run_agent(
             AgentCommand::Message(msg) => msg,
         };
 
+        // A new message while a max-turns prompt is outstanding implicitly
+        // declines it: stash the unsent prompt into history rather than
+        // silently dropping it, then handle the new message normally.
+        if let Some(prompt) = pending_resume.take() {
+            history.push(prompt);
+        }
+
         // Pre-turn: prepend relevant memory context so the model has cross-session recall.
         let message = if let (Some(db), true) = (&memory_db, config.memory.inject_context) {
             let snippets = crate::memory::retrieval::query_relevant(
@@ -609,53 +765,31 @@ pub async fn run_agent(
                 .ok();
         }
 
-        ai_tx
-            .send(AiEvent::ResponseStart(current_model.clone()))
-            .ok();
-
-        let taken = std::mem::take(&mut history);
-        let stream = agent.stream_chat(message, taken).await;
-        let mut tool_records: Vec<ToolCallRecord> = Vec::new();
-        let result = drive_stream(
-            stream,
+        let (result, tool_records) = drive_turn(
+            &agent,
+            message,
+            &mut history,
             &ai_tx,
             &mut user_rx,
-            &mut history,
             &gate,
             &mut tool_timings,
-            &mut tool_records,
+            &current_model,
+            config.max_turns,
         )
         .await;
 
-        // Post-turn: persist entities extracted from tool calls.
-        if let Some(db) = &memory_db {
-            crate::memory::extract::process_turn(db, &current_model, &tool_records);
-
-            // LLM-based fact extraction — fire-and-forget, opt-in via config.
-            if let Some(model) = config.memory.extract_facts_model.clone() {
-                let text = extract_final_assistant_text(&history);
-                if !text.is_empty() {
-                    let db = Arc::clone(db);
-                    let alias = current_model.clone();
-                    tokio::spawn(crate::memory::extract::extract_facts_async(
-                        db,
-                        text,
-                        model,
-                        alias,
-                    ));
-                }
-            }
-        }
-
-        if matches!(result, DriveResult::Done) {
-            if checkpoint_enabled {
-                git_commit_checkpoint(&ai_tx);
-            }
-            hook_runner.fire(
-                HookEvent::AgentResponse,
-                HashMap::from([("MAGAI_MODEL".to_string(), current_model.clone())]),
-            );
-        }
+        finish_turn(
+            result,
+            &tool_records,
+            &history,
+            &mut pending_resume,
+            &memory_db,
+            &config,
+            &current_model,
+            checkpoint_enabled,
+            &ai_tx,
+            &hook_runner,
+        );
     }
 
     hook_runner.fire(

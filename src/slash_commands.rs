@@ -6,7 +6,10 @@ pub const COMMANDS: &[(&str, &str)] = &[
     ("/model", "show or set the AI model"),
     ("/plugins", "list loaded plugins"),
     ("/provider", "list all models for a provider"),
-    ("/squash", "collapse checkpoint commits into one (optional message)"),
+    (
+        "/squash",
+        "collapse checkpoint commits into one (optional message)",
+    ),
     ("/tools", "enable or disable tools (on/off)"),
     ("/undo", "revert last agent turn (git reset --hard HEAD~1)"),
     ("/quit", "quit the application"),

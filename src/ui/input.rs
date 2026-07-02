@@ -191,6 +191,39 @@ impl App {
                         return Ok(());
                     }
 
+                    // Max-turns prompt intercepts digits/Backspace/Enter/Esc exclusively
+                    if self.pending_max_turns.is_some() {
+                        match key.code {
+                            KeyCode::Char(c) if c.is_ascii_digit() => {
+                                self.max_turns_input.push(c);
+                            }
+                            KeyCode::Backspace => {
+                                self.max_turns_input.pop();
+                            }
+                            KeyCode::Enter => {
+                                let n = if self.max_turns_input.is_empty() {
+                                    10
+                                } else {
+                                    self.max_turns_input.parse().unwrap_or(10)
+                                };
+                                self.user_tx
+                                    .send(crate::ai::AgentCommand::MaxTurnsResponse(Some(n)))
+                                    .ok();
+                                self.pending_max_turns = None;
+                                self.max_turns_input.clear();
+                            }
+                            KeyCode::Esc => {
+                                self.user_tx
+                                    .send(crate::ai::AgentCommand::MaxTurnsResponse(None))
+                                    .ok();
+                                self.pending_max_turns = None;
+                                self.max_turns_input.clear();
+                            }
+                            _ => {}
+                        }
+                        return Ok(());
+                    }
+
                     // Dirty workspace prompt intercepts s/c exclusively
                     if self.pending_dirty_workspace {
                         match key.code {

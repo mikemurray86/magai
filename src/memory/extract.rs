@@ -39,8 +39,7 @@ pub fn process_turn(db: &MemoryDb, session_alias: &str, records: &[ToolCallRecor
         let mut entity_ids: Vec<String> = Vec::new();
 
         for record in records {
-            let args: Value =
-                serde_json::from_str(&record.args_json).unwrap_or(Value::Null);
+            let args: Value = serde_json::from_str(&record.args_json).unwrap_or(Value::Null);
             let entity_id = match record.name.as_str() {
                 "write_file" | "edit_file" => {
                     path_arg(&args).map(|p| (NodeKind::File, p.to_owned(), EdgeKind::Modifies))
@@ -52,22 +51,20 @@ pub fn process_turn(db: &MemoryDb, session_alias: &str, records: &[ToolCallRecor
                     .get("query")
                     .and_then(Value::as_str)
                     .map(|q| (NodeKind::ConceptTag, q.to_owned(), EdgeKind::Mentions)),
-                "shell_command" => {
-                    args.get("command").and_then(Value::as_str).map(|cmd| {
-                        let first_arg = args
-                            .get("args")
-                            .and_then(Value::as_array)
-                            .and_then(|a| a.first())
-                            .and_then(Value::as_str)
-                            .unwrap_or("");
-                        let concept = if first_arg.is_empty() {
-                            cmd.to_owned()
-                        } else {
-                            format!("{cmd} {first_arg}")
-                        };
-                        (NodeKind::ConceptTag, concept, EdgeKind::Mentions)
-                    })
-                }
+                "shell_command" => args.get("command").and_then(Value::as_str).map(|cmd| {
+                    let first_arg = args
+                        .get("args")
+                        .and_then(Value::as_array)
+                        .and_then(|a| a.first())
+                        .and_then(Value::as_str)
+                        .unwrap_or("");
+                    let concept = if first_arg.is_empty() {
+                        cmd.to_owned()
+                    } else {
+                        format!("{cmd} {first_arg}")
+                    };
+                    (NodeKind::ConceptTag, concept, EdgeKind::Mentions)
+                }),
                 _ => None,
             };
             if let Some((kind, name, ek)) = entity_id {

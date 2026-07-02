@@ -285,7 +285,10 @@ impl App {
                             .bg(Color::Green)
                             .add_modifier(Modifier::BOLD),
                     ),
-                    Span::styled(" stash & enable undo    ", Style::default().fg(Color::Green)),
+                    Span::styled(
+                        " stash & enable undo    ",
+                        Style::default().fg(Color::Green),
+                    ),
                     Span::styled(
                         " c ",
                         Style::default()
@@ -304,6 +307,58 @@ impl App {
                         .border_style(Style::default().fg(Color::Yellow))
                         .title(Span::styled(
                             " uncommitted changes ",
+                            Style::default()
+                                .fg(Color::Yellow)
+                                .add_modifier(Modifier::BOLD),
+                        )),
+                ),
+                card_rect,
+            );
+        }
+
+        // ── max turns reached prompt card ───────────────────
+        if let Some(max_turns) = self.pending_max_turns {
+            let card_w = (area.width.saturating_sub(8)).min(58);
+            let card_h = 7_u16;
+            let card_x = (area.width.saturating_sub(card_w)) / 2;
+            let card_y = (area.height.saturating_sub(card_h)) / 2;
+            let card_rect = Rect::new(card_x, card_y, card_w, card_h);
+            let shown = if self.max_turns_input.is_empty() {
+                "10".to_string()
+            } else {
+                self.max_turns_input.clone()
+            };
+            let card_lines = vec![
+                Line::from(Span::styled(
+                    format!("  Reached {max_turns} turns without finishing."),
+                    Style::default().fg(Color::Yellow),
+                )),
+                Line::raw(""),
+                Line::from(vec![
+                    Span::raw("  Continue for "),
+                    Span::styled(shown, Style::default().add_modifier(Modifier::BOLD)),
+                    Span::raw(" more turns?"),
+                ]),
+                Line::raw(""),
+                Line::from(vec![
+                    Span::styled(
+                        " Enter ",
+                        Style::default().fg(Color::Black).bg(Color::Green),
+                    ),
+                    Span::styled(" confirm   ", Style::default().fg(Color::Green)),
+                    Span::styled(" Esc ", Style::default().fg(Color::Black).bg(Color::Yellow)),
+                    Span::styled(" stop   ", Style::default().fg(Color::Yellow)),
+                    Span::raw("type digits to change amount"),
+                ]),
+            ];
+            frame.render_widget(Clear, card_rect);
+            frame.render_widget(
+                Paragraph::new(card_lines).block(
+                    Block::new()
+                        .borders(Borders::ALL)
+                        .border_style(Style::default().fg(Color::Yellow))
+                        .title(Span::styled(
+                            " max turns reached ",
                             Style::default()
                                 .fg(Color::Yellow)
                                 .add_modifier(Modifier::BOLD),

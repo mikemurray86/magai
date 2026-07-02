@@ -7,7 +7,8 @@ use std::pin::Pin;
 use std::time::Instant;
 
 use futures::{Stream, StreamExt};
-use rig::agent::MultiTurnStreamItem;
+use rig::agent::{MultiTurnStreamItem, StreamingError};
+use rig::completion::request::PromptError;
 use rig::message::{Message, ToolResultContent};
 use rig::streaming::{StreamedAssistantContent, StreamedUserContent};
 use tokio::sync::mpsc;
@@ -37,14 +38,23 @@ pub(crate) enum OurItem {
         call_id: String,
         result: String,
     },
+    /// Rig aborted the stream after `max_turns` turns without a final
+    /// response. `history`/`pending_prompt` are rig's own
+    /// `MaxTurnsError::chat_history`/`::prompt` — the exact state needed to
+    /// resume without re-doing (and re-executing) already-made tool calls.
+    MaxTurnsReached {
+        history: Vec<Message>,
+        pending_prompt: Message,
+        max_turns: usize,
+    },
 }
 
 /// A boxed stream of normalized items — the type `DynAgent::stream_chat`
 /// returns, regardless of which provider produced the underlying stream.
 pub(crate) type OurStream = Pin<Box<dyn Stream<Item = OurItem> + Send>>;
 
-pub(crate) fn map_item<R, E: std::fmt::Display>(
-    item: Result<MultiTurnStreamItem<R>, E>,
+pub(crate) fn map_item<R>(
+    item: Result<MultiTurnStreamItem<R>, rig::agent::StreamingError>,
 ) -> Option<OurItem> {
     match item {
         Ok(MultiTurnStreamItem::StreamAssistantItem(StreamedAssistantContent::Text(t))) => {
@@ -79,6 +89,18 @@ pub(crate) fn map_item<R, E: std::fmt::Display>(
         Ok(MultiTurnStreamItem::FinalResponse(fin)) => Some(OurItem::History(
             fin.history().map(|h| h.to_vec()).unwrap_or_default(),
         )),
+        Err(StreamingError::Prompt(boxed)) => match *boxed {
+            PromptError::MaxTurnsError {
+                max_turns,
+                chat_history,
+                prompt,
+            } => Some(OurItem::MaxTurnsReached {
+                history: *chat_history,
+                pending_prompt: *prompt,
+                max_turns,
+            }),
+            other => Some(OurItem::Error(other.to_string())),
+        },
         Err(e) => Some(OurItem::Error(e.to_string())),
         _ => None,
     }
@@ -91,6 +113,14 @@ pub(crate) fn map_item<R, E: std::fmt::Display>(
 pub(crate) enum DriveResult {
     Done,
     Cancelled,
+    /// Rig hit its turn cap. `pending_prompt` is the message that still
+    /// needs to be sent to resume — `history` (the `&mut` param) has
+    /// already been updated to the exact chat history rig had accumulated
+    /// at the cutoff, so resuming is `agent.stream_chat(pending_prompt,
+    /// history)`, not a fresh turn.
+    MaxTurnsReached {
+        pending_prompt: Box<Message>,
+    },
 }
 
 pub(crate) async fn drive_stream(
@@ -148,6 +178,13 @@ pub(crate) async fn drive_stream(
                         ai_tx.send(AiEvent::Error(e)).ok();
                         return DriveResult::Done;
                     }
+                    Some(OurItem::MaxTurnsReached { history: h, pending_prompt, max_turns }) => {
+                        *history = h;
+                        ai_tx.send(AiEvent::MaxTurnsReached { max_turns }).ok();
+                        return DriveResult::MaxTurnsReached {
+                            pending_prompt: Box::new(pending_prompt),
+                        };
+                    }
                 }
             }
             cmd = user_rx.recv() => {
@@ -171,6 +208,50 @@ pub(crate) async fn drive_stream(
                     Some(_) => {}
                 }
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn map_item_turns_max_turns_error_into_max_turns_reached() {
+        let history = vec![Message::user("earlier turn")];
+        let prompt = Message::user("still pending");
+        let err: StreamingError = StreamingError::Prompt(Box::new(PromptError::MaxTurnsError {
+            max_turns: 25,
+            chat_history: Box::new(history.clone()),
+            prompt: Box::new(prompt.clone()),
+        }));
+        let item: Result<MultiTurnStreamItem<()>, StreamingError> = Err(err);
+
+        match map_item(item) {
+            Some(OurItem::MaxTurnsReached {
+                history: h,
+                pending_prompt,
+                max_turns,
+            }) => {
+                assert_eq!(max_turns, 25);
+                assert_eq!(h, history);
+                assert_eq!(pending_prompt, prompt);
+            }
+            _ => panic!("expected OurItem::MaxTurnsReached"),
+        }
+    }
+
+    #[test]
+    fn map_item_other_errors_still_stringify() {
+        let err: StreamingError = StreamingError::Prompt(Box::new(PromptError::PromptCancelled {
+            chat_history: vec![],
+            reason: "boom".to_string(),
+        }));
+        let item: Result<MultiTurnStreamItem<()>, StreamingError> = Err(err);
+
+        match map_item(item) {
+            Some(OurItem::Error(msg)) => assert!(msg.contains("boom")),
+            _ => panic!("expected OurItem::Error"),
         }
     }
 }
