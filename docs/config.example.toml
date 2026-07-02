@@ -66,10 +66,22 @@ alias = "sonnet"
 provider = "anthropic"
 model = "claude-sonnet-4-5"
 
+# Optional per-model system prompt: replaces the default preamble
+# (src/ai/preamble.md) entirely when this model is active. Project
+# instructions (AGENTS.md/CLAUDE.md), if present, are still appended.
+# `system_prompt` (inline) takes precedence over `system_prompt_file`
+# (a path, relative to the cwd or absolute) if both are set.
+# [[named_models]]
+# alias = "reviewer"
+# provider = "anthropic"
+# model = "claude-sonnet-4-5"
+# system_prompt = "You are a meticulous code reviewer. Only report bugs; never edit files."
+
 # [[named_models]]
 # alias = "proxy"
 # provider = "proxy"
 # model = "mistral-7b"
+# system_prompt_file = ".magai/prompts/proxy-agent.md"
 
 
 # ── MCP servers ───────────────────────────────────────────────────────────────

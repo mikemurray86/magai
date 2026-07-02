@@ -129,15 +129,27 @@ submission) live in `ui/input.rs`. `view_width`/`view_height` are recomputed
 from the actual `history_area` each frame and drive both wrapping and
 scroll-offset math — don't hardcode terminal dimensions.
 
-### Project instructions
+### System prompt / project instructions
 
+The base system prompt lives in `src/ai/preamble.md` (pulled in via
+`include_str!` as `ai::PREAMBLE`) — edit that file directly to change the
+default agent persona/instructions, no Rust changes needed.
 `ai::read_project_instructions` looks for `AGENTS.md` then `CLAUDE.md` in the
-working directory and `build_preamble` appends its contents (under a
-"# Project instructions" heading) to the base `PREAMBLE` once at startup. The
-combined preamble is threaded as a `&str` through `resolve_agent` and every
-`build_*` provider constructor — when adding a new provider builder or a new
-way to switch models (alongside `SetModel`/`UseProviderModel`), make sure it
-also receives `&preamble` so project instructions stay in effect.
+working directory and `build_preamble`/`build_preamble_from` append its
+contents (under a "# Project instructions" heading) to the base preamble.
+
+A `[[named_models]]` entry (`config.rs`) can override the base preamble for
+just that model via `system_prompt` (inline) or `system_prompt_file` (path,
+`system_prompt` wins if both are set) — `NamedModel::resolve_system_prompt`
+reads it, and `providers::resolve_agent` swaps it in for `PREAMBLE` before
+calling `build_preamble_from`; project instructions are still appended on
+top either way. The default (non-override) preamble is still built once at
+startup and threaded as a `&str` through `resolve_agent` and every `build_*`
+provider constructor — when adding a new provider builder or a new way to
+switch models (alongside `SetModel`/`UseProviderModel`), make sure it also
+receives `&preamble` (and, if it should support per-model overrides,
+`&project_ctx` plus a `find_named_model` lookup) so project instructions
+stay in effect.
 
 ### Git safety net
 

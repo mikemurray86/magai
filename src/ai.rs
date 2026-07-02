@@ -27,10 +27,12 @@ use providers::{
 use stream::{drive_stream, DriveResult};
 
 pub const DEFAULT_MODEL: &str = "granite4:latest";
-const PREAMBLE: &str =
-    "You are a helpful coding agent. \
-     For file operations use read_file, read_file_range, write_file, edit_file, or list_directory. \
-     Reserve shell_command for build/test/install/git commands and other tasks no dedicated tool covers.";
+
+/// The default system preamble, kept in its own file so it's easy to read
+/// and tweak without wading through `ai.rs`. Per-model overrides (see
+/// `NamedModel::system_prompt`/`system_prompt_file` in `config.rs`) replace
+/// this text entirely rather than appending to it.
+const PREAMBLE: &str = include_str!("ai/preamble.md");
 
 pub enum AgentCommand {
     Message(String),
@@ -56,10 +58,17 @@ pub enum AgentCommand {
 /// Combines the base system preamble with project-specific instructions
 /// from `AGENTS.md`/`CLAUDE.md`, if present.
 fn build_preamble(project_ctx: &str) -> String {
+    build_preamble_from(PREAMBLE, project_ctx)
+}
+
+/// Same as `build_preamble`, but with an explicit base preamble rather than
+/// the global default — used by `resolve_agent` when a named model supplies
+/// its own `system_prompt`/`system_prompt_file`.
+pub(crate) fn build_preamble_from(base: &str, project_ctx: &str) -> String {
     if project_ctx.trim().is_empty() {
-        PREAMBLE.to_string()
+        base.to_string()
     } else {
-        format!("{PREAMBLE}\n\n# Project instructions\n\n{project_ctx}")
+        format!("{base}\n\n# Project instructions\n\n{project_ctx}")
     }
 }
 
@@ -280,11 +289,13 @@ fn extract_final_assistant_text(history: &[Message]) -> String {
         .unwrap_or_default()
 }
 
-/// Sends `ResponseStart`, streams `prompt` against `history` (which is taken
-/// and replaced in place, same as `OurItem::History`/`MaxTurnsReached`
-/// handling inside `drive_stream`), and returns the outcome plus whatever
-/// tool calls were recorded. Shared by the fresh-message path and the
-/// max-turns continuation path so both get identical stream-driving.
+/// Sends `ResponseStart`, streams `prompt` against `history` (sent as a
+/// clone so `*history` still holds the pre-turn conversation if the turn is
+/// cancelled; only overwritten in place by `OurItem::History`/`MaxTurnsReached`
+/// handling inside `drive_stream` once the turn actually completes), and
+/// returns the outcome plus whatever tool calls were recorded. Shared by the
+/// fresh-message path and the max-turns continuation path so both get
+/// identical stream-driving.
 #[allow(clippy::too_many_arguments)]
 async fn drive_turn(
     agent: &DynAgent,
@@ -300,8 +311,7 @@ async fn drive_turn(
     ai_tx
         .send(AiEvent::ResponseStart(current_model.to_string()))
         .ok();
-    let taken = std::mem::take(history);
-    let stream = agent.stream_chat(prompt, taken, max_turns).await;
+    let stream = agent.stream_chat(prompt, history.clone(), max_turns).await;
     let mut tool_records: Vec<ToolCallRecord> = Vec::new();
     let result = drive_stream(
         stream,
@@ -467,7 +477,7 @@ pub async fn run_agent(
     let startup = config.default_model.as_deref().unwrap_or(DEFAULT_MODEL);
 
     let (mut agent, mut current_model) =
-        match resolve_agent(startup, &config, &preamble, ts(tools_enabled)) {
+        match resolve_agent(startup, &config, &preamble, &project_ctx, ts(tools_enabled)) {
             Ok(pair) => pair,
             Err(_) => match build_ollama(DEFAULT_MODEL, &preamble, Some(tool_handle.clone())) {
                 Ok(agent) => (agent, DEFAULT_MODEL.to_string()),
@@ -542,7 +552,7 @@ pub async fn run_agent(
     while let Some(cmd) = user_rx.recv().await {
         let message = match cmd {
             AgentCommand::SetModel(alias) => {
-                match resolve_agent(&alias, &config, &preamble, ts(tools_enabled)) {
+                match resolve_agent(&alias, &config, &preamble, &project_ctx, ts(tools_enabled)) {
                     Ok((new_agent, display)) => {
                         agent = new_agent;
                         current_model = display;
@@ -555,7 +565,13 @@ pub async fn run_agent(
             }
             AgentCommand::SetTools(enabled) => {
                 tools_enabled = enabled;
-                match resolve_agent(&current_model, &config, &preamble, ts(tools_enabled)) {
+                match resolve_agent(
+                    &current_model,
+                    &config,
+                    &preamble,
+                    &project_ctx,
+                    ts(tools_enabled),
+                ) {
                     Ok((new_agent, _)) => agent = new_agent,
                     Err(e) => {
                         ai_tx.send(AiEvent::Error(e)).ok();

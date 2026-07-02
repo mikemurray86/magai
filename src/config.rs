@@ -25,6 +25,33 @@ pub struct NamedModel {
     pub alias: String,
     pub provider: String,
     pub model: String,
+    /// Inline system prompt used instead of the default preamble
+    /// (`src/ai/preamble.md`) when this model is active. Takes precedence
+    /// over `system_prompt_file` if both are set.
+    pub system_prompt: Option<String>,
+    /// Path (relative to the working directory, or absolute) to a file
+    /// whose contents replace the default preamble when this model is
+    /// active. Ignored if `system_prompt` is also set.
+    pub system_prompt_file: Option<String>,
+}
+
+impl NamedModel {
+    /// Reads this model's custom system prompt, if configured. `system_prompt`
+    /// wins over `system_prompt_file`; returns `Ok(None)` when neither is set.
+    pub fn resolve_system_prompt(&self) -> Result<Option<String>, String> {
+        if let Some(s) = &self.system_prompt {
+            return Ok(Some(s.clone()));
+        }
+        if let Some(path) = &self.system_prompt_file {
+            return std::fs::read_to_string(path).map(Some).map_err(|e| {
+                format!(
+                    "system_prompt_file {path:?} for model {:?}: {e}",
+                    self.alias
+                )
+            });
+        }
+        Ok(None)
+    }
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -174,6 +201,56 @@ mod tests {
         let (nm, pc) = cfg.find_named_model("gpt4o").expect("gpt4o resolves");
         assert_eq!(nm.model, "gpt-4o");
         assert_eq!(pc.provider_type, ProviderType::OpenAI);
+    }
+
+    #[test]
+    fn resolve_system_prompt_prefers_inline_over_file() {
+        let nm = NamedModel {
+            alias: "a".to_string(),
+            provider: "p".to_string(),
+            model: "m".to_string(),
+            system_prompt: Some("inline prompt".to_string()),
+            system_prompt_file: Some("/nonexistent/path/does-not-matter".to_string()),
+        };
+        assert_eq!(
+            nm.resolve_system_prompt().unwrap().as_deref(),
+            Some("inline prompt")
+        );
+    }
+
+    #[test]
+    fn resolve_system_prompt_reads_file_when_no_inline() {
+        let dir =
+            std::env::temp_dir().join(format!("magai-test-system-prompt-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("prompt.md");
+        std::fs::write(&path, "from file").unwrap();
+
+        let nm = NamedModel {
+            alias: "a".to_string(),
+            provider: "p".to_string(),
+            model: "m".to_string(),
+            system_prompt: None,
+            system_prompt_file: Some(path.to_string_lossy().to_string()),
+        };
+        assert_eq!(
+            nm.resolve_system_prompt().unwrap().as_deref(),
+            Some("from file")
+        );
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn resolve_system_prompt_none_when_unset() {
+        let nm = NamedModel {
+            alias: "a".to_string(),
+            provider: "p".to_string(),
+            model: "m".to_string(),
+            system_prompt: None,
+            system_prompt_file: None,
+        };
+        assert_eq!(nm.resolve_system_prompt().unwrap(), None);
     }
 
     #[test]

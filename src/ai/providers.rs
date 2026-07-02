@@ -117,29 +117,38 @@ pub(crate) fn build_anthropic(
     Ok(dyn_agent_from!(agent))
 }
 
+/// Resolves `alias` to a built agent. If the alias names a `[[named_models]]`
+/// entry with `system_prompt`/`system_prompt_file` set, that text replaces
+/// `default_preamble` (still combined with `project_ctx`, per
+/// `build_preamble_from`); otherwise `default_preamble` is used as-is.
 pub(crate) fn resolve_agent(
     alias: &str,
     config: &Config,
-    preamble: &str,
+    default_preamble: &str,
+    project_ctx: &str,
     tool_server: Option<ToolServerHandle>,
 ) -> Result<(DynAgent, String), String> {
     match config.find_named_model(alias) {
         Some((nm, pc)) => {
+            let preamble = match nm.resolve_system_prompt()? {
+                Some(base) => super::build_preamble_from(&base, project_ctx),
+                None => default_preamble.to_string(),
+            };
             let agent = match pc.provider_type {
-                ProviderType::Ollama => build_ollama(&nm.model, preamble, tool_server),
+                ProviderType::Ollama => build_ollama(&nm.model, &preamble, tool_server),
                 ProviderType::OpenAI | ProviderType::Groq => {
                     let key = api_key_from_env(pc.api_key_env.as_deref())?;
                     build_openai(
                         &nm.model,
                         &key,
                         pc.base_url.as_deref(),
-                        preamble,
+                        &preamble,
                         tool_server,
                     )
                 }
                 ProviderType::Anthropic => {
                     let key = api_key_from_env(pc.api_key_env.as_deref())?;
-                    build_anthropic(&nm.model, &key, preamble, tool_server)
+                    build_anthropic(&nm.model, &key, &preamble, tool_server)
                 }
                 ProviderType::Gemini => Err(format!(
                     "provider {:?} is not yet supported",
@@ -148,7 +157,7 @@ pub(crate) fn resolve_agent(
             }?;
             Ok((agent, alias.to_string()))
         }
-        None => build_ollama(alias, preamble, tool_server).map(|a| (a, alias.to_string())),
+        None => build_ollama(alias, default_preamble, tool_server).map(|a| (a, alias.to_string())),
     }
 }
 
