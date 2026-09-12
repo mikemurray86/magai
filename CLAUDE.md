@@ -36,7 +36,18 @@ logic: `tools::glob`, `slash_commands`, `config`, and `ui::text`. Add new ones
 the same way for any newly-extracted pure logic — there's no separate test
 directory or harness.
 
-There is no README, lint config, or CI in the repo currently — don't assume
+CI (`.github/workflows/ci.yml`) runs on every PR and push to `main`: `cargo fmt
+--all --check`, `cargo clippy --locked --all-targets -- -D warnings`, `cargo
+test --locked`, and a release build. Clippy is a hard gate, so a new warning
+fails the PR — fix it rather than allowing the lint. `--locked` is used
+throughout, so a dependency change must commit the updated `Cargo.lock`.
+
+Tagging `v<version>` triggers `.github/workflows/release.yml`, which refuses to
+publish unless the tag matches the `Cargo.toml` version, then attaches
+`.tar.gz` + `.sha256` binaries for linux-x86_64 and macOS (arm64, x86_64) to a
+release that stays a draft until every platform has uploaded.
+
+There is no README or lint config in the repo currently — don't assume
 conventions beyond what's in the source.
 
 ## Architecture

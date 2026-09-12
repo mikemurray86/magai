@@ -127,5 +127,5 @@ fn html_to_text(html: &str) -> String {
 }
 
 fn io_err(e: impl std::fmt::Display) -> std::io::Error {
-    std::io::Error::new(std::io::ErrorKind::Other, e.to_string())
+    std::io::Error::other(e.to_string())
 }

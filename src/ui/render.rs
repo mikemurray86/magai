@@ -17,7 +17,7 @@ impl App {
     pub(super) fn draw(&mut self, frame: &mut Frame) {
         self.spinner_frame = self.spinner_frame.wrapping_add(1);
         let area = frame.area();
-        let input_h = (self.textarea.lines().len() as u16).max(1).min(5);
+        let input_h = (self.textarea.lines().len() as u16).clamp(1, 5);
         // Update textarea style to reflect waiting state
         self.textarea.set_style(if self.is_waiting {
             Style::default()
