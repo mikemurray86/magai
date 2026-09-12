@@ -25,6 +25,8 @@ pub enum AiEvent {
         provider: String,
         models: Vec<String>,
     },
+    /// Rendered `/mcp` report: configured servers and their connection state.
+    McpStatus(String),
     ToolCallStart {
         call_id: String,
         name: String,
@@ -48,6 +50,12 @@ pub enum AiEvent {
     DirtyWorkspacePrompt,
     MaxTurnsReached {
         max_turns: usize,
+    },
+    /// Sent after a finished turn's transcript has been persisted (only when
+    /// `[quality] enabled = true`), so the UI can attach a `/rate` rating to
+    /// it without re-deriving turn identity.
+    TurnRecorded {
+        turn_id: String,
     },
 }
 
@@ -100,11 +108,13 @@ pub struct App {
     config: crate::config::Config,
     model_ac_idx: Option<usize>,
     provider_ac_idx: Option<usize>,
+    cmd_ac_idx: Option<usize>,
     provider_models: Option<(String, Vec<String>)>,
     provider_model_sel: usize,
     pending_dirty_workspace: bool,
     pending_max_turns: Option<usize>,
     max_turns_input: String,
+    last_turn_id: Option<String>,
 }
 
 impl App {
@@ -144,11 +154,13 @@ impl App {
             config,
             model_ac_idx: None,
             provider_ac_idx: None,
+            cmd_ac_idx: None,
             provider_models: None,
             provider_model_sel: 0,
             pending_dirty_workspace: false,
             pending_max_turns: None,
             max_turns_input: String::new(),
+            last_turn_id: None,
         }
     }
 
@@ -278,6 +290,9 @@ impl App {
                     self.textarea = make_textarea("", false);
                     self.model_ac_idx = None;
                 }
+                AiEvent::McpStatus(report) => {
+                    self.push_system(report);
+                }
                 AiEvent::DirtyWorkspacePrompt => {
                     self.pending_dirty_workspace = true;
                 }
@@ -287,8 +302,25 @@ impl App {
                     self.max_turns_input.clear();
                     self.auto_scroll = true;
                 }
+                AiEvent::TurnRecorded { turn_id } => {
+                    self.last_turn_id = Some(turn_id);
+                }
             }
         }
+    }
+
+    /// Slash commands (built-in + skills) matching the typed prefix. Only
+    /// active while the first line is a single `/word` — once an argument is
+    /// being typed the `/model` and `/provider` completions take over.
+    fn cmd_ac_candidates(&self) -> Vec<(String, String)> {
+        if self.textarea.lines().len() != 1 || self.provider_models.is_some() {
+            return vec![];
+        }
+        let first_line = self.textarea.lines().first().cloned().unwrap_or_default();
+        if !first_line.starts_with('/') || first_line.contains(char::is_whitespace) {
+            return vec![];
+        }
+        crate::slash_commands::matching_commands(&first_line, &self.skills)
     }
 
     fn model_ac_candidates(&self) -> Vec<&crate::config::NamedModel> {

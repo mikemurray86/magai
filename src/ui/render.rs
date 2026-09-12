@@ -26,13 +26,14 @@ impl App {
         } else {
             Style::default().fg(Color::White)
         });
-        let [title_area, sep_top, history_area, sep_bot, input_area] =
+        let [title_area, sep_top, history_area, sep_bot, input_area, status_area] =
             area.layout(&Layout::vertical([
                 Constraint::Length(1),
                 Constraint::Length(1),
                 Constraint::Fill(1),
                 Constraint::Length(1),
                 Constraint::Length(input_h),
+                Constraint::Length(1),
             ]));
 
         self.view_height = history_area.height;
@@ -40,18 +41,12 @@ impl App {
 
         // ── title ─────────────────────────────────────────
         frame.render_widget(
-            Paragraph::new(Line::from(vec![
-                Span::styled(
-                    "  magai",
-                    Style::default()
-                        .fg(Color::White)
-                        .add_modifier(Modifier::BOLD),
-                ),
-                Span::styled(
-                    format!("  [{}]", self.current_model),
-                    Style::default().fg(Color::DarkGray),
-                ),
-            ])),
+            Paragraph::new(Line::from(Span::styled(
+                "  magai",
+                Style::default()
+                    .fg(Color::White)
+                    .add_modifier(Modifier::BOLD),
+            ))),
             title_area,
         );
 
@@ -79,8 +74,16 @@ impl App {
         // ── input ─────────────────────────────────────────
         frame.render_widget(&self.textarea, input_area);
 
+        // ── model label (under the input) ─────────────────
+        frame.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                format!("  [{}]", self.current_model),
+                Style::default().fg(Color::DarkGray),
+            ))),
+            status_area,
+        );
+
         // ── command / model popup ─────────────────────────
-        let first_line = self.textarea.lines().first().cloned().unwrap_or_default();
         if self.textarea.lines().len() == 1 && self.pending_approval.is_none() {
             let model_candidates = self.model_ac_candidates();
             if !model_candidates.is_empty() {
@@ -170,11 +173,11 @@ impl App {
                         ),
                         popup_rect,
                     );
-                } else if first_line.starts_with('/') {
-                    let matches =
-                        crate::slash_commands::matching_commands(&first_line, &self.skills);
+                } else {
+                    let matches = self.cmd_ac_candidates();
                     if !matches.is_empty() {
-                        let popup_h = matches.len() as u16 + 2;
+                        let max_rows = history_area.height.saturating_sub(4).min(12) as usize;
+                        let popup_h = matches.len().min(max_rows) as u16 + 2;
                         let popup_w = 40_u16.min(history_area.width.saturating_sub(4));
                         let popup_rect = Rect::new(
                             history_area.x + 2,
@@ -182,20 +185,37 @@ impl App {
                             popup_w,
                             popup_h,
                         );
-                        let popup_lines: Vec<Line> = matches
+                        // scroll the window so the selected row stays visible
+                        let selected = self.cmd_ac_idx;
+                        let start = match selected {
+                            Some(i) if i >= max_rows => i - max_rows + 1,
+                            _ => 0,
+                        };
+                        let popup_lines: Vec<Line> = matches[start..]
                             .iter()
-                            .map(|(name, desc)| {
-                                Line::from(vec![
-                                    Span::styled(
-                                        format!(" {name:<12}"),
+                            .take(max_rows)
+                            .enumerate()
+                            .map(|(i, (name, desc))| {
+                                let is_sel = selected == Some(start + i);
+                                let (name_style, desc_style) = if is_sel {
+                                    (
+                                        Style::default()
+                                            .fg(Color::Black)
+                                            .bg(Color::Yellow)
+                                            .add_modifier(Modifier::BOLD),
+                                        Style::default().fg(Color::Black).bg(Color::Yellow),
+                                    )
+                                } else {
+                                    (
                                         Style::default()
                                             .fg(Color::Yellow)
                                             .add_modifier(Modifier::BOLD),
-                                    ),
-                                    Span::styled(
-                                        desc.to_string(),
                                         Style::default().fg(Color::DarkGray),
-                                    ),
+                                    )
+                                };
+                                Line::from(vec![
+                                    Span::styled(format!(" {name:<12}"), name_style),
+                                    Span::styled(desc.to_string(), desc_style),
                                 ])
                             })
                             .collect();

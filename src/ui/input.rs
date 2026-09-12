@@ -51,6 +51,18 @@ fn memory_clear(config: &crate::config::Config) -> String {
     }
 }
 
+fn rate_turn(config: &crate::config::Config, turn_id: &str, verdict: &str, note: &str) -> String {
+    if !config.quality.enabled {
+        return "quality tracking is disabled ([quality] enabled = true to turn on)".to_string();
+    }
+    let Some(db) = memory_db_for(config) else {
+        return "quality tracking is disabled".to_string();
+    };
+    let rationale = (!note.is_empty()).then_some(note);
+    crate::memory::quality::record_rating(&db, turn_id, "user", Some(verdict), None, rationale);
+    format!("rated last turn: {verdict}")
+}
+
 impl App {
     fn handle_slash_command(&mut self, input: &str) {
         use crate::slash_commands::{dispatch, SlashCommandAction};
@@ -117,6 +129,10 @@ impl App {
             SlashCommandAction::ShowPlugins => {
                 self.push_system(crate::plugins::summary(&self.plugins));
             }
+            SlashCommandAction::ShowMcp => {
+                // status lives with the agent task, so it answers via AiEvent
+                self.user_tx.send(crate::ai::AgentCommand::ListMcp).ok();
+            }
             SlashCommandAction::MemorySearch(query) => {
                 let msg = memory_search(&self.config, &query);
                 self.push_system(msg);
@@ -125,9 +141,47 @@ impl App {
                 let msg = memory_clear(&self.config);
                 self.push_system(msg);
             }
+            SlashCommandAction::Rate(verdict, note) => {
+                let Some(turn_id) = self.last_turn_id.clone() else {
+                    self.push_system("nothing to rate yet".to_string());
+                    return;
+                };
+                let msg = rate_turn(&self.config, &turn_id, &verdict, &note);
+                self.push_system(msg);
+            }
             SlashCommandAction::ShowMessage(msg) | SlashCommandAction::Unknown(msg) => {
                 self.push_system(msg);
             }
+        }
+    }
+
+    /// Tab-completion for the slash-command popup: fills the longest prefix
+    /// shared by all matches (which completes a unique match outright), and
+    /// cycles through the candidates once there's nothing more to share.
+    fn complete_slash_command(&mut self) {
+        let cmds = self.cmd_ac_candidates();
+        if cmds.is_empty() {
+            return;
+        }
+        if let Some(i) = self.cmd_ac_idx {
+            let next = (i + 1) % cmds.len();
+            self.cmd_ac_idx = Some(next);
+            let name = cmds[next].0.clone();
+            self.textarea = make_textarea(&name, false);
+            return;
+        }
+        let line = self.textarea.lines().first().cloned().unwrap_or_default();
+        let common = crate::slash_commands::common_completion(&line, &self.skills)
+            .unwrap_or_else(|| line.clone());
+        if common.len() > line.len() {
+            self.textarea = make_textarea(&common, false);
+            if cmds.len() == 1 {
+                self.cmd_ac_idx = Some(0);
+            }
+        } else {
+            self.cmd_ac_idx = Some(0);
+            let name = cmds[0].0.clone();
+            self.textarea = make_textarea(&name, false);
         }
     }
 
@@ -325,6 +379,8 @@ impl App {
                                     let model_id = filtered[sel].to_string();
                                     self.textarea = make_textarea(&model_id, false);
                                 }
+                            } else if !self.cmd_ac_candidates().is_empty() {
+                                self.complete_slash_command();
                             } else {
                                 let candidates = self.model_ac_candidates();
                                 if !candidates.is_empty() {
@@ -377,6 +433,19 @@ impl App {
                                 self.provider_models = None;
                                 self.textarea = make_textarea("", false);
                             } else {
+                                let cmds = self.cmd_ac_candidates();
+                                if !cmds.is_empty() {
+                                    let line =
+                                        self.textarea.lines().first().cloned().unwrap_or_default();
+                                    if let Some(idx) = self.cmd_ac_idx {
+                                        let name = cmds[idx.min(cmds.len() - 1)].0.clone();
+                                        self.textarea = make_textarea(&name, false);
+                                    } else if cmds.len() == 1 && cmds[0].0 != line {
+                                        // unambiguous: `/q` submits as `/quit`
+                                        let name = cmds[0].0.clone();
+                                        self.textarea = make_textarea(&name, false);
+                                    }
+                                }
                                 let candidates = self.model_ac_candidates();
                                 if !candidates.is_empty() {
                                     if let Some(idx) = self.model_ac_idx {
@@ -399,6 +468,7 @@ impl App {
                                 }
                                 self.model_ac_idx = None;
                                 self.provider_ac_idx = None;
+                                self.cmd_ac_idx = None;
                                 self.submit_input();
                             }
                         }
@@ -415,6 +485,15 @@ impl App {
                                     };
                                 }
                             } else if self.textarea.lines().len() == 1 {
+                                let cmds = self.cmd_ac_candidates();
+                                if !cmds.is_empty() {
+                                    let n = cmds.len();
+                                    self.cmd_ac_idx = Some(match self.cmd_ac_idx {
+                                        None | Some(0) => n - 1,
+                                        Some(i) => i - 1,
+                                    });
+                                    return Ok(());
+                                }
                                 let candidates = self.model_ac_candidates();
                                 if !candidates.is_empty() {
                                     let n = candidates.len();
@@ -449,6 +528,15 @@ impl App {
                                     self.provider_model_sel = (self.provider_model_sel + 1) % n;
                                 }
                             } else if self.textarea.lines().len() == 1 {
+                                let cmds = self.cmd_ac_candidates();
+                                if !cmds.is_empty() {
+                                    let n = cmds.len();
+                                    self.cmd_ac_idx = Some(match self.cmd_ac_idx {
+                                        None => 0,
+                                        Some(i) => (i + 1) % n,
+                                    });
+                                    return Ok(());
+                                }
                                 let candidates = self.model_ac_candidates();
                                 if !candidates.is_empty() {
                                     let n = candidates.len();
@@ -500,6 +588,7 @@ impl App {
                                 self.history_cursor = None;
                                 self.model_ac_idx = None;
                                 self.provider_ac_idx = None;
+                                self.cmd_ac_idx = None;
                             }
                         }
 

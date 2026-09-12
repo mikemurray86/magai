@@ -1,5 +1,6 @@
 pub mod extract;
 pub mod graph;
+pub mod quality;
 pub mod retrieval;
 mod schema;
 

@@ -10,6 +10,15 @@ read/write/edit, shell, git, grep, web fetch, MCP servers) against the local
 project, with an approval gate for dangerous operations. Conceptually it's a
 Claude-Code-like agent harness, written in Rust.
 
+## CLI vs TUI
+
+`main.rs` parses `cli::Cli` first: a subcommand runs in the terminal and exits,
+bare `magai` opens the TUI. `cli.rs` currently hosts `magai mcp add/list/get/
+remove`, which edit `~/.config/magai/config.toml` through `toml_edit` so
+comments and formatting survive; `add_server`/`remove_server` operate on a
+`DocumentMut` and are unit-tested without touching the filesystem. Subcommands
+return `Result<(), String>` and `main` prints the message to stderr and exits 1.
+
 ## Common commands
 
 ```sh
@@ -79,6 +88,9 @@ a `GatedTool` (approval.rs), which:
 `write_file`, `edit_file`, and `shell_command` are marked dangerous; everything
 else (reads, search, git status/diff, web fetch) is not. New tools should be
 registered in `build_tool_server` (`ai/mod.rs`) with an explicit danger flag.
+The five values a `GatedTool` needs (mode, gate map, event sender, hook runner,
+outcome counter) are bundled as `approval::GateContext`; `ctx.wrap(tool,
+dangerous)` is how both built-in and MCP tools get gated.
 `grep_search` and `find_files` share their glob-pattern matching via
 `tools::glob` (`glob_to_regex`/`glob_match`) rather than duplicating it.
 
@@ -94,9 +106,21 @@ registered in `build_tool_server` (`ai/mod.rs`) with an explicit danger flag.
 - **Hooks** (`hooks.rs`) are shell commands fired fire-and-forget on lifecycle
   events (`session_start`, `session_stop`, `pre_tool_call`, `post_tool_call`,
   `agent_response`), with `MAGAI_*` env vars carrying context.
-- **MCP servers** (`mcp.rs`) are spawned as child processes and connected via
-  `rmcp`, exposing their tools through the same `ToolServerHandle` as built-in
-  tools.
+- **MCP servers** (`mcp.rs`) are reached over stdio (a spawned child process) or
+  streamable HTTP (a remote `url`, with optional `bearer_token`/`headers`) —
+  `McpServerConfig::transport` (`config.rs`) decides which, expanding `${VAR}`
+  references from the environment. `GatedMcpHandler` replaces rig's
+  `McpClientHandler` so each discovered tool is wrapped in a `GatedTool` before
+  being registered on the shared `ToolServerHandle`: MCP tools are treated as
+  dangerous unless the server is marked `trusted`, and a tool whose name is
+  already taken is skipped rather than shadowing the existing one. Servers are
+  connected after every built-in tool is registered so that check sees them all;
+  connection failures surface as `AiEvent::Error` in the TUI. `/mcp` reports
+  each configured server (transport, gating, live tool list) — the status lives
+  with the agent task, so it round-trips as `AgentCommand::ListMcp` →
+  `AiEvent::McpStatus`. A child server's stderr is piped (never inherited — it
+  would scribble over the TUI) and its tail is appended to connection errors,
+  and each connection is bounded by the server's `timeout_secs`.
 
 Plugin-provided hooks/skills/MCP configs are merged with config-level ones in
 `run_agent` — when touching one of these systems, check whether the plugin path

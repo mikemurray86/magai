@@ -9,11 +9,22 @@ use crate::skills::Skill;
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct McpServerDef {
-    pub command: String,
+    #[serde(default)]
+    pub command: Option<String>,
     #[serde(default)]
     pub args: Vec<String>,
     #[serde(default)]
     pub env: HashMap<String, String>,
+    #[serde(default)]
+    pub url: Option<String>,
+    #[serde(default)]
+    pub headers: HashMap<String, String>,
+    #[serde(default)]
+    pub bearer_token: Option<String>,
+    #[serde(default)]
+    pub trusted: bool,
+    #[serde(default)]
+    pub timeout_secs: Option<u64>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -114,6 +125,11 @@ pub fn extract_mcp_configs(plugins: &[Plugin]) -> Vec<McpServerConfig> {
                 command: s.command.clone(),
                 args: s.args.clone(),
                 env: s.env.clone(),
+                url: s.url.clone(),
+                headers: s.headers.clone(),
+                bearer_token: s.bearer_token.clone(),
+                trusted: s.trusted,
+                timeout_secs: s.timeout_secs,
             })
         })
         .collect()
@@ -180,7 +196,12 @@ pub fn summary(plugins: &[Plugin]) -> String {
             lines.push(format!("  {desc}"));
         }
         if let Some(mcp) = &plugin.manifest.mcp_server {
-            lines.push(format!("  mcp: {}", mcp.command));
+            let target = mcp
+                .url
+                .clone()
+                .or_else(|| mcp.command.clone())
+                .unwrap_or_else(|| "<no command or url>".to_string());
+            lines.push(format!("  mcp: {target}"));
         }
         if !plugin.manifest.skills.is_empty() {
             let names: Vec<_> = plugin

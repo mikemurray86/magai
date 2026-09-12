@@ -14,7 +14,7 @@ use rig::message::Message;
 use rig::tool::server::{ToolServer, ToolServerHandle};
 use tokio::sync::mpsc;
 
-use crate::approval::{ApprovalGate, GatedTool, PermissionMode};
+use crate::approval::{ApprovalGate, GateContext, ToolOutcomeCounter};
 use crate::config::{Config, ProviderType};
 use crate::hooks::{HookEvent, HookRunner};
 use crate::memory::{default_db_path, MemoryDb, ToolCallRecord};
@@ -49,6 +49,8 @@ pub enum AgentCommand {
     /// paused turn for `n` more turns, `None` declines and ends the turn.
     MaxTurnsResponse(Option<usize>),
     ListModels(String),
+    /// Request the `/mcp` status report for the configured servers.
+    ListMcp,
     UseProviderModel {
         provider_alias: String,
         model_id: String,
@@ -74,27 +76,12 @@ pub(crate) fn build_preamble_from(base: &str, project_ctx: &str) -> String {
 
 // ── tool server ───────────────────────────────────────────────────────────────
 
-async fn build_tool_server(
-    mode: PermissionMode,
-    gate: ApprovalGate,
-    ai_tx: mpsc::UnboundedSender<AiEvent>,
-    hook_runner: Arc<HookRunner>,
-) -> ToolServerHandle {
+async fn build_tool_server(ctx: &GateContext) -> ToolServerHandle {
     let handle = ToolServer::new().run();
 
     macro_rules! add {
         ($tool:expr, $dangerous:expr) => {
-            handle
-                .add_tool(GatedTool::new(
-                    $tool,
-                    $dangerous,
-                    mode,
-                    gate.clone(),
-                    ai_tx.clone(),
-                    hook_runner.clone(),
-                ))
-                .await
-                .ok();
+            handle.add_tool(ctx.wrap($tool, $dangerous)).await.ok();
         };
     }
 
@@ -289,6 +276,38 @@ fn extract_final_assistant_text(history: &[Message]) -> String {
         .unwrap_or_default()
 }
 
+/// Finds the first user-authored text in `messages` — the original prompt for
+/// a turn, as opposed to any `UserContent::ToolResult` messages that follow
+/// tool calls within the same turn.
+fn extract_user_text(messages: &[Message]) -> String {
+    use rig::message::UserContent;
+    messages
+        .iter()
+        .find_map(|msg| {
+            if let Message::User { content, .. } = msg {
+                let text: String = content
+                    .iter()
+                    .filter_map(|c| match c {
+                        UserContent::Text(t) => Some(t.text.as_str()),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>()
+                    .join("");
+                (!text.is_empty()).then_some(text)
+            } else {
+                None
+            }
+        })
+        .unwrap_or_default()
+}
+
+fn epoch_secs() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs() as i64
+}
+
 /// Sends `ResponseStart`, streams `prompt` against `history` (sent as a
 /// clone so `*history` still holds the pre-turn conversation if the turn is
 /// cancelled; only overwritten in place by `OurItem::History`/`MaxTurnsReached`
@@ -335,6 +354,8 @@ fn finish_turn(
     result: DriveResult,
     tool_records: &[ToolCallRecord],
     history: &[Message],
+    turn_start_idx: usize,
+    turn_started_at: i64,
     pending_resume: &mut Option<Message>,
     memory_db: &Option<Arc<MemoryDb>>,
     config: &Config,
@@ -342,6 +363,9 @@ fn finish_turn(
     checkpoint_enabled: bool,
     ai_tx: &mpsc::UnboundedSender<AiEvent>,
     hook_runner: &HookRunner,
+    tool_outcomes: &ToolOutcomeCounter,
+    session_id: &Option<String>,
+    turn_seq: &mut usize,
 ) {
     if let Some(db) = memory_db {
         crate::memory::extract::process_turn(db, current_model, tool_records);
@@ -355,6 +379,54 @@ fn finish_turn(
                 tokio::spawn(crate::memory::extract::extract_facts_async(
                     db, text, model, alias,
                 ));
+            }
+        }
+
+        // Session/turn transcript + quality tracking — opt-in via config.
+        if config.quality.enabled {
+            if let Some(session_id) = session_id {
+                let outcome = match &result {
+                    DriveResult::Done => "done",
+                    DriveResult::MaxTurnsReached { .. } => "max_turns_reached",
+                    DriveResult::Cancelled => "cancelled",
+                };
+                let turn_slice = &history[turn_start_idx.min(history.len())..];
+                let user_text = extract_user_text(turn_slice);
+                let assistant_text = extract_final_assistant_text(turn_slice);
+                let stats = std::mem::take(&mut *tool_outcomes.lock().unwrap());
+                *turn_seq += 1;
+
+                let turn_id = crate::memory::quality::record_turn(
+                    db,
+                    session_id,
+                    *turn_seq,
+                    current_model,
+                    outcome,
+                    &user_text,
+                    &assistant_text,
+                    tool_records,
+                    stats,
+                    turn_started_at,
+                    epoch_secs(),
+                );
+                ai_tx
+                    .send(AiEvent::TurnRecorded {
+                        turn_id: turn_id.clone(),
+                    })
+                    .ok();
+
+                if outcome == "done" && !assistant_text.is_empty() {
+                    if let Some(judge_model) = config.quality.judge_model.clone() {
+                        let db = Arc::clone(db);
+                        tokio::spawn(crate::memory::quality::judge_turn_async(
+                            db,
+                            turn_id,
+                            judge_model,
+                            user_text,
+                            assistant_text,
+                        ));
+                    }
+                }
             }
         }
     }
@@ -396,18 +468,16 @@ pub async fn run_agent(
         .collect();
     let hook_runner = Arc::new(HookRunner::new(all_hooks));
 
-    let mode = config.permission_mode;
     let gate: ApprovalGate = Arc::new(Mutex::new(HashMap::new()));
-    let tool_handle =
-        build_tool_server(mode, gate.clone(), ai_tx.clone(), hook_runner.clone()).await;
-
-    let all_mcp: Vec<_> = config
-        .mcp_servers
-        .iter()
-        .chain(plugin_mcp_configs.iter())
-        .cloned()
-        .collect();
-    let _mcp_services = crate::mcp::connect_servers(&all_mcp, tool_handle.clone()).await;
+    let tool_outcomes: ToolOutcomeCounter = Arc::new(Mutex::new((0, 0, 0)));
+    let gate_ctx = GateContext {
+        mode: config.permission_mode,
+        gate: gate.clone(),
+        event_tx: ai_tx.clone(),
+        hook_runner: hook_runner.clone(),
+        tool_outcomes: tool_outcomes.clone(),
+    };
+    let tool_handle = build_tool_server(&gate_ctx).await;
 
     // ── memory ────────────────────────────────────────────────────────────────
     let memory_db: Option<Arc<MemoryDb>> = if config.memory.enabled {
@@ -421,32 +491,23 @@ pub async fn run_agent(
             Ok(db) => {
                 let db = Arc::new(db);
                 tool_handle
-                    .add_tool(GatedTool::new(
-                        crate::tools::MemoryQuery::new(db.clone()),
-                        false,
-                        mode,
-                        gate.clone(),
-                        ai_tx.clone(),
-                        hook_runner.clone(),
-                    ))
+                    .add_tool(gate_ctx.wrap(crate::tools::MemoryQuery::new(db.clone()), false))
                     .await
                     .ok();
                 tool_handle
-                    .add_tool(GatedTool::new(
-                        crate::tools::MemorySave::new(
-                            db.clone(),
-                            config
-                                .default_model
-                                .as_deref()
-                                .unwrap_or(DEFAULT_MODEL)
-                                .to_string(),
+                    .add_tool(
+                        gate_ctx.wrap(
+                            crate::tools::MemorySave::new(
+                                db.clone(),
+                                config
+                                    .default_model
+                                    .as_deref()
+                                    .unwrap_or(DEFAULT_MODEL)
+                                    .to_string(),
+                            ),
+                            false,
                         ),
-                        false,
-                        mode,
-                        gate.clone(),
-                        ai_tx.clone(),
-                        hook_runner.clone(),
-                    ))
+                    )
                     .await
                     .ok();
                 Some(db)
@@ -461,6 +522,18 @@ pub async fn run_agent(
     } else {
         None
     };
+
+    // ── MCP ───────────────────────────────────────────────────────────────────
+    // Connected last, so a server's tools can be checked against every
+    // built-in name (memory tools included) before being registered.
+    let all_mcp: Vec<_> = config
+        .mcp_servers
+        .iter()
+        .chain(plugin_mcp_configs.iter())
+        .cloned()
+        .collect();
+    let (_mcp_services, mcp_statuses) =
+        crate::mcp::connect_servers(&all_mcp, tool_handle.clone(), gate_ctx.clone()).await;
 
     let project_ctx = read_project_instructions();
     let preamble = build_preamble(&project_ctx);
@@ -496,6 +569,15 @@ pub async fn run_agent(
         HookEvent::SessionStart,
         HashMap::from([("MAGAI_MODEL".to_string(), current_model.clone())]),
     );
+
+    let session_id: Option<String> = if config.quality.enabled {
+        memory_db
+            .as_ref()
+            .map(|db| crate::memory::quality::start_session(db, &current_model))
+    } else {
+        None
+    };
+    let mut turn_seq: usize = 0;
 
     let mut history: Vec<Message> = Vec::new();
     let mut tool_timings: HashMap<String, Instant> = HashMap::new();
@@ -630,11 +712,15 @@ pub async fn run_agent(
                 };
                 match resp {
                     None => {
+                        let turn_start_idx = history.len();
+                        let turn_started_at = epoch_secs();
                         history.push(prompt);
                         finish_turn(
                             DriveResult::Done,
                             &[],
                             &history,
+                            turn_start_idx,
+                            turn_started_at,
                             &mut pending_resume,
                             &memory_db,
                             &config,
@@ -642,12 +728,17 @@ pub async fn run_agent(
                             checkpoint_enabled,
                             &ai_tx,
                             &hook_runner,
+                            &tool_outcomes,
+                            &session_id,
+                            &mut turn_seq,
                         );
                     }
                     Some(n) => {
                         // No agent rebuild needed: `max_turns` is a per-call
                         // `.multi_turn()` cap on the request, not a property
                         // baked into the agent at build time.
+                        let turn_start_idx = history.len();
+                        let turn_started_at = epoch_secs();
                         let (result, tool_records) = drive_turn(
                             &agent,
                             prompt,
@@ -664,6 +755,8 @@ pub async fn run_agent(
                             result,
                             &tool_records,
                             &history,
+                            turn_start_idx,
+                            turn_started_at,
                             &mut pending_resume,
                             &memory_db,
                             &config,
@@ -671,9 +764,18 @@ pub async fn run_agent(
                             checkpoint_enabled,
                             &ai_tx,
                             &hook_runner,
+                            &tool_outcomes,
+                            &session_id,
+                            &mut turn_seq,
                         );
                     }
                 }
+                continue;
+            }
+            AgentCommand::ListMcp => {
+                ai_tx
+                    .send(AiEvent::McpStatus(crate::mcp::summary(&mcp_statuses).await))
+                    .ok();
                 continue;
             }
             AgentCommand::ListModels(alias) => {
@@ -781,6 +883,8 @@ pub async fn run_agent(
                 .ok();
         }
 
+        let turn_start_idx = history.len();
+        let turn_started_at = epoch_secs();
         let (result, tool_records) = drive_turn(
             &agent,
             message,
@@ -798,6 +902,8 @@ pub async fn run_agent(
             result,
             &tool_records,
             &history,
+            turn_start_idx,
+            turn_started_at,
             &mut pending_resume,
             &memory_db,
             &config,
@@ -805,7 +911,14 @@ pub async fn run_agent(
             checkpoint_enabled,
             &ai_tx,
             &hook_runner,
+            &tool_outcomes,
+            &session_id,
+            &mut turn_seq,
         );
+    }
+
+    if let (Some(db), Some(id)) = (&memory_db, &session_id) {
+        crate::memory::quality::end_session(db, id);
     }
 
     hook_runner.fire(

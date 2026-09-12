@@ -54,14 +54,104 @@ impl NamedModel {
     }
 }
 
-#[derive(Debug, Deserialize, Clone)]
+/// An MCP server, reachable either as a local child process (`command`) or as a
+/// remote streamable-HTTP endpoint (`url`). `url` wins if both are set.
+#[derive(Debug, Deserialize, Clone, Default)]
 pub struct McpServerConfig {
     pub name: String,
-    pub command: String,
+    /// stdio transport: the executable to spawn.
+    #[serde(default)]
+    pub command: Option<String>,
     #[serde(default)]
     pub args: Vec<String>,
     #[serde(default)]
     pub env: HashMap<String, String>,
+    /// streamable-HTTP transport: the endpoint URL.
+    #[serde(default)]
+    pub url: Option<String>,
+    /// Extra HTTP headers sent with every request to a remote server.
+    #[serde(default)]
+    pub headers: HashMap<String, String>,
+    /// Token sent as `Authorization: Bearer <token>` to a remote server.
+    #[serde(default)]
+    pub bearer_token: Option<String>,
+    /// Exempt this server's tools from the approval gate. MCP tools are gated
+    /// as dangerous by default, since what they do is opaque to magai.
+    #[serde(default)]
+    pub trusted: bool,
+    /// How long to wait for the handshake before giving up on this server.
+    /// Defaults to [`McpServerConfig::DEFAULT_TIMEOUT_SECS`] — generous, since
+    /// a first `npx` run may download the server before it says anything.
+    #[serde(default)]
+    pub timeout_secs: Option<u64>,
+}
+
+/// How to reach an [`McpServerConfig`], with `${VAR}` references already
+/// expanded, so secrets can live in the environment rather than in the config.
+#[derive(Debug, Clone, PartialEq)]
+pub enum McpTransport {
+    Stdio {
+        command: String,
+        args: Vec<String>,
+        env: HashMap<String, String>,
+    },
+    Http {
+        url: String,
+        headers: HashMap<String, String>,
+        bearer_token: Option<String>,
+    },
+}
+
+/// Substitutes `${VAR}` with the value of environment variable `VAR` (empty
+/// when unset). An unterminated `${` is left as written.
+pub fn expand_env(raw: &str) -> String {
+    let mut out = String::with_capacity(raw.len());
+    let mut rest = raw;
+    while let Some(start) = rest.find("${") {
+        let Some(end) = rest[start + 2..].find('}') else {
+            break;
+        };
+        let var = &rest[start + 2..start + 2 + end];
+        out.push_str(&rest[..start]);
+        out.push_str(&std::env::var(var).unwrap_or_default());
+        rest = &rest[start + 2 + end + 1..];
+    }
+    out.push_str(rest);
+    out
+}
+
+impl McpServerConfig {
+    pub const DEFAULT_TIMEOUT_SECS: u64 = 30;
+
+    /// Seconds to allow for connecting, before falling back to the default.
+    pub fn timeout(&self) -> std::time::Duration {
+        std::time::Duration::from_secs(self.timeout_secs.unwrap_or(Self::DEFAULT_TIMEOUT_SECS))
+    }
+
+    /// Which transport this entry describes, or a message naming what's missing.
+    pub fn transport(&self) -> Result<McpTransport, String> {
+        let expand_map = |m: &HashMap<String, String>| -> HashMap<String, String> {
+            m.iter().map(|(k, v)| (k.clone(), expand_env(v))).collect()
+        };
+        if let Some(url) = &self.url {
+            return Ok(McpTransport::Http {
+                url: expand_env(url),
+                headers: expand_map(&self.headers),
+                bearer_token: self.bearer_token.as_deref().map(expand_env),
+            });
+        }
+        let Some(command) = &self.command else {
+            return Err(format!(
+                "MCP server '{}': needs either `command` (stdio) or `url` (remote)",
+                self.name
+            ));
+        };
+        Ok(McpTransport::Stdio {
+            command: expand_env(command),
+            args: self.args.iter().map(|a| expand_env(a)).collect(),
+            env: expand_map(&self.env),
+        })
+    }
 }
 
 #[derive(Debug, Deserialize, Default, Clone)]
@@ -85,6 +175,8 @@ pub struct Config {
     pub memory: MemoryConfig,
     #[serde(default = "default_true")]
     pub git_checkpointing: bool,
+    #[serde(default)]
+    pub quality: QualityConfig,
 }
 
 fn default_max_context_tokens() -> usize {
@@ -134,6 +226,19 @@ impl Default for MemoryConfig {
     }
 }
 
+/// Session/turn transcript + quality-rating tracking, for a future
+/// fine-tuning export. Disabled by default since it persists full
+/// conversation text.
+#[derive(Debug, Deserialize, Clone, Default)]
+pub struct QualityConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    /// When set, enables LLM-as-judge rating of each finished turn using
+    /// this Ollama model name (e.g. "granite4:latest"). Disabled by default
+    /// because it adds a background HTTP call per turn.
+    pub judge_model: Option<String>,
+}
+
 impl Config {
     /// Loads the config, falling back to `Config::default()` on any read or
     /// parse error. The second element of the tuple carries a human-readable
@@ -168,7 +273,8 @@ impl Config {
     }
 }
 
-fn config_path() -> Option<PathBuf> {
+/// `~/.config/magai/config.toml` (honouring `XDG_CONFIG_HOME`).
+pub fn config_path() -> Option<PathBuf> {
     let base = std::env::var("XDG_CONFIG_HOME")
         .map(PathBuf::from)
         .or_else(|_| std::env::var("HOME").map(|h| PathBuf::from(h).join(".config")))
@@ -182,6 +288,88 @@ mod tests {
     use crate::approval::PermissionMode;
 
     const EXAMPLE: &str = include_str!("../docs/config.example.toml");
+
+    #[test]
+    fn stdio_server_transport() {
+        let cfg: Config = toml::from_str(
+            r#"
+            [[mcp_servers]]
+            name = "fs"
+            command = "npx"
+            args = ["-y", "server-filesystem", "/tmp"]
+            [mcp_servers.env]
+            TOKEN = "abc"
+            "#,
+        )
+        .expect("stdio server should parse");
+        let server = &cfg.mcp_servers[0];
+        assert!(!server.trusted, "servers are gated unless marked trusted");
+        match server.transport().expect("stdio transport") {
+            McpTransport::Stdio { command, args, env } => {
+                assert_eq!(command, "npx");
+                assert_eq!(args.len(), 3);
+                assert_eq!(env.get("TOKEN").map(String::as_str), Some("abc"));
+            }
+            other => panic!("expected stdio, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn http_server_transport_wins_over_command() {
+        let cfg: Config = toml::from_str(
+            r#"
+            [[mcp_servers]]
+            name = "remote"
+            command = "ignored"
+            url = "https://mcp.example.com/mcp"
+            bearer_token = "tok"
+            trusted = true
+            [mcp_servers.headers]
+            X-Tenant = "acme"
+            "#,
+        )
+        .expect("remote server should parse");
+        let server = &cfg.mcp_servers[0];
+        assert!(server.trusted);
+        match server.transport().expect("http transport") {
+            McpTransport::Http {
+                url,
+                headers,
+                bearer_token,
+            } => {
+                assert_eq!(url, "https://mcp.example.com/mcp");
+                assert_eq!(bearer_token.as_deref(), Some("tok"));
+                assert_eq!(headers.get("X-Tenant").map(String::as_str), Some("acme"));
+            }
+            other => panic!("expected http, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn server_without_command_or_url_is_rejected() {
+        let cfg: Config = toml::from_str(
+            r#"
+            [[mcp_servers]]
+            name = "broken"
+            "#,
+        )
+        .expect("entry should parse");
+        let err = cfg.mcp_servers[0].transport().unwrap_err();
+        assert!(
+            err.contains("broken"),
+            "error should name the server: {err}"
+        );
+    }
+
+    #[test]
+    fn expand_env_substitutes_and_tolerates_junk() {
+        std::env::set_var("MAGAI_TEST_TOKEN", "s3cret");
+        assert_eq!(expand_env("Bearer ${MAGAI_TEST_TOKEN}"), "Bearer s3cret");
+        assert_eq!(expand_env("${MAGAI_TEST_UNSET_VAR}!"), "!");
+        assert_eq!(expand_env("plain"), "plain");
+        // an unterminated `${` is left alone rather than eating the rest
+        assert_eq!(expand_env("a ${oops"), "a ${oops");
+    }
 
     #[test]
     fn parses_example_config() {

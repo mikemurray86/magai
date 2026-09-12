@@ -1,5 +1,6 @@
 mod ai;
 mod approval;
+mod cli;
 mod config;
 mod hooks;
 mod mcp;
@@ -10,6 +11,7 @@ mod slash_commands;
 mod tools;
 mod ui;
 
+use clap::Parser;
 use crossterm::{
     event::{DisableMouseCapture, EnableMouseCapture},
     execute,
@@ -19,6 +21,15 @@ use ui::AiEvent;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // A subcommand runs in the terminal and exits; bare `magai` opens the TUI.
+    if let Some(command) = cli::Cli::parse().command {
+        if let Err(e) = cli::run(command).await {
+            eprintln!("error: {e}");
+            std::process::exit(1);
+        }
+        return Ok(());
+    }
+
     let (user_tx, user_rx) = mpsc::unbounded_channel::<ai::AgentCommand>();
     let (ai_tx, ai_rx) = mpsc::unbounded_channel::<AiEvent>();
 

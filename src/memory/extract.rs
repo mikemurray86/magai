@@ -10,9 +10,8 @@ use super::MemoryDb;
 pub struct ToolCallRecord {
     pub name: String,
     pub args_json: String,
-    // Stored for v3 LLM-based fact extraction; not used in v1/v2 rule extraction.
-    #[allow(dead_code)]
     pub result: String,
+    pub elapsed_ms: u64,
 }
 
 /// Extracts entities from `records` and persists them to the graph.

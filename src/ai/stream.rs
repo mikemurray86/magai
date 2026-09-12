@@ -165,6 +165,7 @@ pub(crate) async fn drive_stream(
                                 name,
                                 args_json,
                                 result: result.clone(),
+                                elapsed_ms,
                             });
                         }
                         ai_tx.send(AiEvent::ToolCallResult { call_id, result, elapsed_ms }).ok();

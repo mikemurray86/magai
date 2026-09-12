@@ -2,10 +2,15 @@ pub const COMMANDS: &[(&str, &str)] = &[
     ("/clear", "clear conversation history"),
     ("/exit", "quit the application"),
     ("/help", "show available commands"),
+    ("/mcp", "list configured MCP servers and their status"),
     ("/memory", "search or manage persistent memory"),
     ("/model", "show or set the AI model"),
     ("/plugins", "list loaded plugins"),
     ("/provider", "list all models for a provider"),
+    (
+        "/rate",
+        "rate the last turn (good/bad/neutral) for fine-tuning data",
+    ),
     (
         "/squash",
         "collapse checkpoint commits into one (optional message)",
@@ -30,6 +35,26 @@ pub fn matching_commands(prefix: &str, skills: &[crate::skills::Skill]) -> Vec<(
     results
 }
 
+/// Longest common prefix shared by every command matching `prefix`.
+///
+/// `/q` with only `/quit` matching yields `"/quit"`; `/me` with `/memory` and
+/// `/memory-clear` matching yields `"/memory"`. `None` when nothing matches.
+pub fn common_completion(prefix: &str, skills: &[crate::skills::Skill]) -> Option<String> {
+    let matches = matching_commands(prefix, skills);
+    let (first, _) = matches.first()?;
+    let mut common = first.clone();
+    for (name, _) in matches.iter().skip(1) {
+        let len: usize = common
+            .chars()
+            .zip(name.chars())
+            .take_while(|(a, b)| a == b)
+            .map(|(a, _)| a.len_utf8())
+            .sum();
+        common.truncate(len);
+    }
+    Some(common)
+}
+
 pub enum SlashCommandAction {
     Exit,
     SetModel(String),
@@ -41,9 +66,11 @@ pub enum SlashCommandAction {
     ListModels(String),
     ShowMessage(String),
     ShowPlugins,
+    ShowMcp,
     RunSkill(String),
     MemorySearch(String),
     MemoryClear,
+    Rate(String, String),
     Unknown(String),
 }
 
@@ -58,6 +85,7 @@ pub fn dispatch(input: &str, skills: &[crate::skills::Skill]) -> SlashCommandAct
         "/undo" => SlashCommandAction::Undo,
         "/squash" => SlashCommandAction::Squash(arg.to_string()),
         "/plugins" => SlashCommandAction::ShowPlugins,
+        "/mcp" => SlashCommandAction::ShowMcp,
         "/model" => {
             if arg.is_empty() {
                 SlashCommandAction::ShowModel
@@ -81,13 +109,27 @@ pub fn dispatch(input: &str, skills: &[crate::skills::Skill]) -> SlashCommandAct
             "clear" => SlashCommandAction::MemoryClear,
             _ => SlashCommandAction::MemorySearch(arg.to_string()),
         },
+        "/rate" => {
+            let mut it = arg.splitn(2, char::is_whitespace);
+            let verdict = it.next().unwrap_or("");
+            let note = it.next().unwrap_or("").trim().to_string();
+            match verdict {
+                "good" | "bad" | "neutral" => SlashCommandAction::Rate(verdict.to_string(), note),
+                _ => SlashCommandAction::ShowMessage(
+                    "usage: /rate good|bad|neutral [note]".to_string(),
+                ),
+            }
+        }
         "/help" => SlashCommandAction::ShowMessage(
             "/clear             —  clear conversation\n\
              /exit, /quit       —  quit the application\n\
              /help              —  show this message\n\
+             /mcp               —  list configured MCP servers and their status\n\
              /memory [query]    —  search memory graph; /memory clear to wipe\n\
              /model [name]      —  show or set the AI model\n\
              /plugins           —  list loaded plugins\n\
+             /provider <alias>  —  list all models offered by a provider\n\
+             /rate good|bad|neutral [note] —  rate the last turn for fine-tuning data\n\
              /squash [message]  —  collapse checkpoint commits; commits if message given\n\
              /tools on|off      —  enable or disable tools\n\
              /undo              —  revert last agent turn (git reset --hard HEAD~1)"
@@ -144,6 +186,23 @@ mod tests {
     }
 
     #[test]
+    fn common_completion_unique_prefix_completes_fully() {
+        assert_eq!(common_completion("/q", &[]).as_deref(), Some("/quit"));
+    }
+
+    #[test]
+    fn common_completion_stops_at_shared_prefix() {
+        let skills = vec![skill("review"), skill("rename")];
+        assert_eq!(common_completion("/r", &skills).as_deref(), Some("/r"));
+        assert_eq!(common_completion("/re", &skills).as_deref(), Some("/re"));
+    }
+
+    #[test]
+    fn common_completion_none_when_no_match() {
+        assert!(common_completion("/zzz", &[]).is_none());
+    }
+
+    #[test]
     fn dispatch_exit_and_quit() {
         assert!(matches!(dispatch("/exit", &[]), SlashCommandAction::Exit));
         assert!(matches!(dispatch("/quit", &[]), SlashCommandAction::Exit));
@@ -157,6 +216,17 @@ mod tests {
             dispatch("/plugins", &[]),
             SlashCommandAction::ShowPlugins
         ));
+        assert!(matches!(dispatch("/mcp", &[]), SlashCommandAction::ShowMcp));
+    }
+
+    #[test]
+    fn help_lists_every_command() {
+        let SlashCommandAction::ShowMessage(help) = dispatch("/help", &[]) else {
+            panic!("/help should show a message");
+        };
+        for (name, _) in COMMANDS {
+            assert!(help.contains(name), "/help omits {name}");
+        }
     }
 
     #[test]
@@ -181,6 +251,32 @@ mod tests {
             SlashCommandAction::ListModels(p) => assert_eq!(p, "openai"),
             _ => panic!("expected ListModels"),
         }
+    }
+
+    #[test]
+    fn dispatch_rate_with_and_without_note() {
+        match dispatch("/rate good", &[]) {
+            SlashCommandAction::Rate(verdict, note) => {
+                assert_eq!(verdict, "good");
+                assert_eq!(note, "");
+            }
+            _ => panic!("expected Rate"),
+        }
+        match dispatch("/rate bad would loop forever", &[]) {
+            SlashCommandAction::Rate(verdict, note) => {
+                assert_eq!(verdict, "bad");
+                assert_eq!(note, "would loop forever");
+            }
+            _ => panic!("expected Rate"),
+        }
+        assert!(matches!(
+            dispatch("/rate maybe", &[]),
+            SlashCommandAction::ShowMessage(_)
+        ));
+        assert!(matches!(
+            dispatch("/rate", &[]),
+            SlashCommandAction::ShowMessage(_)
+        ));
     }
 
     #[test]

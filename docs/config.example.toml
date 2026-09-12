@@ -84,22 +84,70 @@ model = "claude-sonnet-4-5"
 # system_prompt_file = ".magai/prompts/proxy-agent.md"
 
 
+# ── Quality tracking ─────────────────────────────────────────────────────────
+#
+# Persists a transcript of every session/turn (prompt, final response, tool
+# calls, denial/failure counts) to the same sqlite db used by memory, for a
+# future fine-tuning export. Off by default since it stores full conversation
+# text. Rate the most recently finished turn from inside magai with
+# `/rate good|bad|neutral [note]`.
+
+# [quality]
+# enabled = true
+#
+# When set, also asks this Ollama model to judge each finished turn
+# ("good"/"bad"/"neutral" + a short rationale), stored alongside any manual
+# /rate rating. Adds a background HTTP call per turn — omit to disable.
+# judge_model = "granite4:latest"
+
+
 # ── MCP servers ───────────────────────────────────────────────────────────────
 #
-# External tool providers via the Model Context Protocol.
-# Each server is spawned as a child process on startup.
+# External tool providers via the Model Context Protocol. A server is reached
+# either over stdio (set `command` — it is spawned as a child process on
+# startup) or over streamable HTTP (set `url` — `url` wins if both are given).
+#
+# MCP tools go through the same approval gate and pre/post_tool_call hooks as
+# built-in tools, and are treated as dangerous by default: under the default
+# `ask-dangerous` permission mode every MCP call asks first. Set
+# `trusted = true` on a server to exempt its tools from that prompt.
+#
+# A tool whose name is already taken (by a built-in tool or an earlier server)
+# is skipped, with a warning in the TUI.
+#
+# `${VAR}` in a command, arg, url, env value, header value, or bearer_token is
+# replaced with that environment variable, so tokens need not live in this file.
+#
+# Connecting is bounded by `timeout_secs` (default 30) so one unreachable
+# server can't stall startup for the rest.
+#
+# These entries can be managed from the shell instead of by hand:
+#   magai mcp add <name> <command> [args...]      magai mcp list [--check]
+#   magai mcp add --transport http <name> <url>   magai mcp get <name>
+#                                                 magai mcp remove <name>
 
+# ── stdio ──
 # [[mcp_servers]]
 # name = "filesystem"
 # command = "npx"
 # args = ["-y", "@modelcontextprotocol/server-filesystem", "/tmp"]
+# trusted = true
+# timeout_secs = 60      # a first `npx` run may download the server first
 
 # [[mcp_servers]]
 # name = "my-python-server"
 # command = "python"
 # args = ["-m", "my_mcp_server"]
 # [mcp_servers.env]
-# MY_SERVER_TOKEN = "secret"
+# MY_SERVER_TOKEN = "${MY_SERVER_TOKEN}"
+
+# ── remote (streamable HTTP) ──
+# [[mcp_servers]]
+# name = "remote-docs"
+# url = "https://mcp.example.com/mcp"
+# bearer_token = "${EXAMPLE_MCP_TOKEN}"   # sent as `Authorization: Bearer …`
+# [mcp_servers.headers]                   # any extra headers
+# X-Tenant = "acme"
 
 
 # ── Plugins ───────────────────────────────────────────────────────────────────
