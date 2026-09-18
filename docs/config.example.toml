@@ -84,6 +84,50 @@ model = "claude-sonnet-4-5"
 # system_prompt_file = ".magai/prompts/proxy-agent.md"
 
 
+# ── Checkpoints ──────────────────────────────────────────────────────────────
+#
+# magai snapshots the working tree after every turn so you can undo the agent's
+# file changes. Snapshots live in a *shadow* git repository under
+# $XDG_DATA_HOME/magai/checkpoints — your own repository is never written to:
+# no commits, no index changes, no stash, no hooks. It works on a dirty tree,
+# alongside your own commits, and in directories that aren't git repos at all.
+#
+# From inside magai:
+#   /checkpoints   list saved checkpoints
+#   /diff [n]      show what a turn changed
+#   /undo          revert the last turn's file changes (leaves your own edits)
+#   /redo          re-apply what /undo reverted
+#   /restore <n>   reset the whole tree to checkpoint n
+
+# [checkpoints]
+# enabled = true
+#
+# Snapshot this directory instead of the auto-detected project root.
+# root = "~/src/myproject"
+#
+# Where shadow repositories live.
+# store = "~/.local/share/magai/checkpoints"
+#
+# How many checkpoints to keep before the oldest are pruned.
+# keep = 200
+#
+# Extra gitignore-style patterns to leave out of snapshots.
+# exclude = ["fixtures/large/", "*.sqlite"]
+#
+# The built-in exclude list covers build output (target/, dist/, node_modules/),
+# caches and editor junk. It matters most in projects with no .gitignore, where
+# a snapshot would otherwise try to capture target/ wholesale.
+# use_default_excludes = true
+#
+# Copy the project's .git/info/exclude into the shadow repo, which cannot
+# otherwise see it. Your .gitignore files are always honoured either way.
+# copy_project_exclude = true
+#
+# Rows shown by /checkpoints, and the byte cap on /diff output.
+# max_list = 50
+# diff_max_bytes = 20000
+
+
 # ── Quality tracking ─────────────────────────────────────────────────────────
 #
 # Persists a transcript of every session/turn (prompt, final response, tool

@@ -15,6 +15,7 @@ use rig::tool::server::{ToolServer, ToolServerHandle};
 use tokio::sync::mpsc;
 
 use crate::approval::{ApprovalGate, GateContext, ToolOutcomeCounter};
+use crate::checkpoint::{CheckpointStore, SnapshotMeta};
 use crate::config::{Config, ProviderType};
 use crate::hooks::{HookEvent, HookRunner};
 use crate::memory::{default_db_path, MemoryDb, ToolCallRecord};
@@ -42,9 +43,15 @@ pub enum AgentCommand {
     DenyToolCall(String),
     Cancel,
     Clear,
-    Undo,
-    Squash(String),
-    DirtyWorkspaceResponse(bool),
+    /// Work out what a checkpoint action would do, so the UI can confirm it
+    /// before anything is written.
+    CheckpointPreview(crate::checkpoint::CheckpointAction),
+    /// Carry out a previously previewed checkpoint action.
+    CheckpointApply(crate::checkpoint::CheckpointAction),
+    /// Report the checkpoint list back as `AiEvent::CheckpointList`.
+    CheckpointList,
+    /// Report one checkpoint's diff back as `AiEvent::CheckpointDiff`.
+    CheckpointDiff(Option<u64>),
     /// Response to `AiEvent::MaxTurnsReached`: `Some(n)` continues the
     /// paused turn for `n` more turns, `None` declines and ends the turn.
     MaxTurnsResponse(Option<usize>),
@@ -125,132 +132,6 @@ fn trim_history(history: &mut Vec<Message>, max_tokens: usize) -> usize {
         dropped += 1;
     }
     dropped
-}
-
-fn git_is_dirty() -> bool {
-    std::process::Command::new("git")
-        .args(["status", "--porcelain"])
-        .output()
-        .map(|out| !out.stdout.is_empty())
-        .unwrap_or(false)
-}
-
-fn git_commit_checkpoint(ai_tx: &mpsc::UnboundedSender<AiEvent>) {
-    let _ = std::process::Command::new("git")
-        .args(["add", "-A"])
-        .output();
-    let has_staged = std::process::Command::new("git")
-        .args(["diff", "--cached", "--quiet"])
-        .status()
-        .map(|s| !s.success())
-        .unwrap_or(false);
-    if !has_staged {
-        return;
-    }
-    match std::process::Command::new("git")
-        .args(["commit", "-m", "magai-checkpoint"])
-        .output()
-    {
-        Ok(out) if out.status.success() => {}
-        Ok(out) => {
-            ai_tx
-                .send(AiEvent::Error(format!(
-                    "checkpoint failed (undo unavailable this turn): {}",
-                    String::from_utf8_lossy(&out.stderr)
-                )))
-                .ok();
-        }
-        Err(e) => {
-            ai_tx
-                .send(AiEvent::Error(format!("checkpoint error: {e}")))
-                .ok();
-        }
-    }
-}
-
-fn git_undo(ai_tx: &mpsc::UnboundedSender<AiEvent>) {
-    match std::process::Command::new("git")
-        .args(["reset", "--hard", "HEAD~1"])
-        .output()
-    {
-        Ok(out) if out.status.success() => {
-            ai_tx
-                .send(AiEvent::Error("undo: restored previous state".into()))
-                .ok();
-        }
-        Ok(out) => {
-            ai_tx
-                .send(AiEvent::Error(format!(
-                    "undo failed: {}",
-                    String::from_utf8_lossy(&out.stderr)
-                )))
-                .ok();
-        }
-        Err(e) => {
-            ai_tx.send(AiEvent::Error(format!("undo error: {e}"))).ok();
-        }
-    }
-}
-
-fn git_squash(start_sha: &str, message: &str, ai_tx: &mpsc::UnboundedSender<AiEvent>) {
-    match std::process::Command::new("git")
-        .args(["reset", "--soft", start_sha])
-        .output()
-    {
-        Ok(out) if !out.status.success() => {
-            ai_tx
-                .send(AiEvent::Error(format!(
-                    "squash reset failed: {}",
-                    String::from_utf8_lossy(&out.stderr)
-                )))
-                .ok();
-            return;
-        }
-        Err(e) => {
-            ai_tx
-                .send(AiEvent::Error(format!("squash reset error: {e}")))
-                .ok();
-            return;
-        }
-        _ => {}
-    }
-    if message.is_empty() {
-        ai_tx
-            .send(AiEvent::Error(
-                "squash: checkpoint commits collapsed — staged changes ready to commit".into(),
-            ))
-            .ok();
-        return;
-    }
-    match std::process::Command::new("git")
-        .args(["commit", "-m", message])
-        .output()
-    {
-        Ok(out) if out.status.success() => {
-            ai_tx
-                .send(AiEvent::Error(format!(
-                    "squash: committed as \"{message}\""
-                )))
-                .ok();
-        }
-        Ok(out) => {
-            ai_tx
-                .send(AiEvent::Error(format!(
-                    "squash commit failed: {}",
-                    String::from_utf8_lossy(&out.stderr)
-                )))
-                .ok();
-        }
-        Err(e) => {
-            ai_tx
-                .send(AiEvent::Error(format!("squash commit error: {e}")))
-                .ok();
-        }
-    }
-}
-
-fn is_git_repo() -> bool {
-    std::path::Path::new(".git").exists()
 }
 
 fn extract_final_assistant_text(history: &[Message]) -> String {
@@ -345,10 +226,68 @@ async fn drive_turn(
     (result, tool_records)
 }
 
+/// Snapshots the working tree after a turn. Called for **every** outcome, not
+/// just `Done`: a cancelled or max-turns turn still changed files, and the old
+/// implementation's `Done`-only checkpoint is why `/undo` used to revert the
+/// wrong turn after a Ctrl-C.
+async fn snapshot_turn(
+    store: &Option<Arc<CheckpointStore>>,
+    ai_tx: &mpsc::UnboundedSender<AiEvent>,
+    outcome: &str,
+    label: &str,
+    model: &str,
+    turn_seq: usize,
+) {
+    let Some(store) = store else { return };
+    let meta = SnapshotMeta::turn(label, model, turn_seq, outcome);
+    let s = Arc::clone(store);
+    match tokio::task::spawn_blocking(move || s.snapshot(&meta)).await {
+        // A turn that changed no files leaves no checkpoint behind.
+        Ok(Ok(_)) => {}
+        Ok(Err(e)) => {
+            ai_tx
+                .send(AiEvent::Error(format!("checkpoint failed: {e}")))
+                .ok();
+        }
+        Err(e) => {
+            ai_tx
+                .send(AiEvent::Error(format!("checkpoint task failed: {e}")))
+                .ok();
+        }
+    }
+}
+
+/// Labels a finished turn's checkpoint. Read before `finish_turn` consumes
+/// the `DriveResult`.
+fn drive_outcome(result: &DriveResult) -> &'static str {
+    match result {
+        DriveResult::Done => "done",
+        DriveResult::Cancelled => "cancelled",
+        DriveResult::MaxTurnsReached { .. } => "max_turns",
+    }
+}
+
+/// Title for the confirmation card.
+fn describe_action(
+    action: crate::checkpoint::CheckpointAction,
+    target: &crate::checkpoint::Checkpoint,
+) -> String {
+    use crate::checkpoint::CheckpointAction;
+    match action {
+        CheckpointAction::Undo => format!("undo #{} — {}", target.id, target.label),
+        CheckpointAction::Redo => format!("redo #{} — {}", target.id, target.label),
+        CheckpointAction::Restore(_) => format!(
+            "restore the whole tree to #{} — {}",
+            target.id, target.label
+        ),
+    }
+}
+
 /// Post-turn bookkeeping shared by every path that finishes driving a turn:
-/// memory extraction, and — depending on outcome — either the checkpoint
-/// commit + `AgentResponse` hook (`Done`) or stashing the resume prompt for
-/// the next `MaxTurnsResponse` (`MaxTurnsReached`).
+/// memory extraction, and — depending on outcome — either the `AgentResponse`
+/// hook (`Done`) or stashing the resume prompt for the next
+/// `MaxTurnsResponse` (`MaxTurnsReached`). Snapshots are taken separately by
+/// `snapshot_turn`, which must fire for every outcome rather than just `Done`.
 #[allow(clippy::too_many_arguments)]
 fn finish_turn(
     result: DriveResult,
@@ -360,13 +299,16 @@ fn finish_turn(
     memory_db: &Option<Arc<MemoryDb>>,
     config: &Config,
     current_model: &str,
-    checkpoint_enabled: bool,
     ai_tx: &mpsc::UnboundedSender<AiEvent>,
     hook_runner: &HookRunner,
     tool_outcomes: &ToolOutcomeCounter,
     session_id: &Option<String>,
     turn_seq: &mut usize,
 ) {
+    // Counted for every turn, not just recorded ones: checkpoint labels read
+    // it whether or not quality tracking is enabled.
+    *turn_seq += 1;
+
     if let Some(db) = memory_db {
         crate::memory::extract::process_turn(db, current_model, tool_records);
 
@@ -394,7 +336,6 @@ fn finish_turn(
                 let user_text = extract_user_text(turn_slice);
                 let assistant_text = extract_final_assistant_text(turn_slice);
                 let stats = std::mem::take(&mut *tool_outcomes.lock().unwrap());
-                *turn_seq += 1;
 
                 let turn_id = crate::memory::quality::record_turn(
                     db,
@@ -433,9 +374,6 @@ fn finish_turn(
 
     match result {
         DriveResult::Done => {
-            if checkpoint_enabled {
-                git_commit_checkpoint(ai_tx);
-            }
             hook_runner.fire(
                 HookEvent::AgentResponse,
                 HashMap::from([("MAGAI_MODEL".to_string(), current_model.to_string())]),
@@ -585,51 +523,54 @@ pub async fn run_agent(
     // still-unsent prompt so `MaxTurnsResponse` can resume or discard it.
     let mut pending_resume: Option<Message> = None;
 
-    let in_git = is_git_repo();
-    let checkpointing_configured = in_git && config.git_checkpointing;
-
-    let session_start_sha: Option<String> = if checkpointing_configured {
-        std::process::Command::new("git")
-            .args(["rev-parse", "HEAD"])
-            .output()
-            .ok()
-            .and_then(|o| {
-                o.status
-                    .success()
-                    .then(|| String::from_utf8_lossy(&o.stdout).trim().to_string())
-            })
+    // Per-turn snapshots live in a shadow repository outside the project, so a
+    // dirty working tree is simply the baseline — nothing is asked of the user
+    // and their own repository is never written to.
+    let checkpoints: Option<Arc<CheckpointStore>> = if config.checkpoints.enabled {
+        let session = session_id.clone().unwrap_or_else(|| "anon".to_string());
+        match CheckpointStore::open(&config.checkpoints, &session) {
+            Ok(store) => Some(Arc::new(store)),
+            Err(e) => {
+                ai_tx
+                    .send(AiEvent::Error(format!("checkpoints unavailable: {e}")))
+                    .ok();
+                None
+            }
+        }
     } else {
         None
     };
 
-    let checkpoint_enabled = if checkpointing_configured && git_is_dirty() {
-        ai_tx.send(AiEvent::DirtyWorkspacePrompt).ok();
-        let mut enabled = false;
-        loop {
-            match user_rx.recv().await {
-                Some(AgentCommand::DirtyWorkspaceResponse(stash)) => {
-                    if stash {
-                        let _ = std::process::Command::new("git")
-                            .args([
-                                "stash",
-                                "push",
-                                "--include-untracked",
-                                "-m",
-                                "magai-user-stash",
-                            ])
-                            .output();
-                        enabled = true;
-                    }
-                    break;
-                }
-                None => return,
-                _ => {}
+    if let Some(store) = &checkpoints {
+        let s = Arc::clone(store);
+        // `add -A` walks the whole tree, so keep it off the reactor. Awaited so
+        // the baseline is ordered before the first turn.
+        let baseline = tokio::task::spawn_blocking(move || {
+            let outcome = s.snapshot(&SnapshotMeta::baseline());
+            let _ = s.prune(); // best-effort; never blocks a session
+            outcome
+        })
+        .await;
+        match baseline {
+            Ok(Ok(_)) => {}
+            Ok(Err(e)) => {
+                ai_tx
+                    .send(AiEvent::Error(format!("checkpoint baseline failed: {e}")))
+                    .ok();
+            }
+            Err(e) => {
+                ai_tx
+                    .send(AiEvent::Error(format!("checkpoint task failed: {e}")))
+                    .ok();
             }
         }
-        enabled
-    } else {
-        checkpointing_configured
-    };
+    }
+
+    // The sha `/undo` last reverted, so a second consecutive `/undo` steps one
+    // turn further back. Cleared whenever a new turn is snapshotted.
+    let mut undo_cursor: Option<String> = None;
+    // The prompt that started the current turn, used to label its checkpoint.
+    let mut last_prompt_label = String::new();
 
     while let Some(cmd) = user_rx.recv().await {
         let message = match cmd {
@@ -666,52 +607,131 @@ pub async fn run_agent(
                 ai_tx.send(AiEvent::HistoryCleared).ok();
                 continue;
             }
-            AgentCommand::Undo => {
-                if checkpoint_enabled {
-                    git_undo(&ai_tx);
-                } else if !in_git {
-                    ai_tx
-                        .send(AiEvent::Error(
-                            "undo is not available (not a git repository)".into(),
-                        ))
-                        .ok();
-                } else {
-                    ai_tx
-                        .send(AiEvent::Error(
-                            "undo is not available (session started with uncommitted changes)"
-                                .into(),
-                        ))
-                        .ok();
-                }
+            AgentCommand::CheckpointList => {
+                let msg = match &checkpoints {
+                    Some(store) => {
+                        let s = Arc::clone(store);
+                        let max = config.checkpoints.max_list;
+                        match tokio::task::spawn_blocking(move || s.list(max)).await {
+                            Ok(Ok(cps)) => crate::checkpoint::render_list(&cps, epoch_secs()),
+                            Ok(Err(e)) => format!("checkpoints: {e}"),
+                            Err(e) => format!("checkpoints: {e}"),
+                        }
+                    }
+                    None => "checkpoints are disabled".to_string(),
+                };
+                ai_tx.send(AiEvent::CheckpointList(msg)).ok();
                 continue;
             }
-            AgentCommand::Squash(message) => {
-                if let Some(ref sha) = session_start_sha {
-                    if checkpoint_enabled {
-                        git_squash(sha, &message, &ai_tx);
-                    } else {
+            AgentCommand::CheckpointDiff(id) => {
+                match &checkpoints {
+                    Some(store) => {
+                        let s = Arc::clone(store);
+                        match tokio::task::spawn_blocking(move || s.show(id)).await {
+                            Ok(Ok(text)) => {
+                                ai_tx.send(AiEvent::CheckpointDiff(text)).ok();
+                            }
+                            Ok(Err(e)) => {
+                                ai_tx.send(AiEvent::Error(format!("diff: {e}"))).ok();
+                            }
+                            Err(e) => {
+                                ai_tx.send(AiEvent::Error(format!("diff: {e}"))).ok();
+                            }
+                        }
+                    }
+                    None => {
                         ai_tx
-                            .send(AiEvent::Error(
-                                "squash is not available (checkpointing disabled)".into(),
-                            ))
+                            .send(AiEvent::Error("checkpoints are disabled".into()))
                             .ok();
                     }
-                } else {
-                    ai_tx
-                        .send(AiEvent::Error(
-                            "squash is not available (not a git repository)".into(),
-                        ))
-                        .ok();
                 }
                 continue;
             }
-            AgentCommand::DirtyWorkspaceResponse(_) => continue,
+            AgentCommand::CheckpointPreview(action) => {
+                let Some(store) = &checkpoints else {
+                    ai_tx
+                        .send(AiEvent::Error("checkpoints are disabled".into()))
+                        .ok();
+                    continue;
+                };
+                let s = Arc::clone(store);
+                let cursor = undo_cursor.clone();
+                let planned =
+                    tokio::task::spawn_blocking(move || s.plan(action, cursor.as_deref())).await;
+                match planned {
+                    Ok(Ok(plan)) => {
+                        ai_tx
+                            .send(AiEvent::CheckpointPreview {
+                                action,
+                                title: describe_action(action, &plan.target),
+                                lines: crate::checkpoint::render_stat(&plan.stat, 10),
+                                blocked: plan.blocked.clone(),
+                            })
+                            .ok();
+                    }
+                    Ok(Err(e)) => {
+                        ai_tx.send(AiEvent::Error(e.to_string())).ok();
+                    }
+                    Err(e) => {
+                        ai_tx.send(AiEvent::Error(format!("checkpoint: {e}"))).ok();
+                    }
+                }
+                continue;
+            }
+            AgentCommand::CheckpointApply(action) => {
+                let Some(store) = &checkpoints else {
+                    ai_tx
+                        .send(AiEvent::Error("checkpoints are disabled".into()))
+                        .ok();
+                    continue;
+                };
+                let s = Arc::clone(store);
+                let cursor = undo_cursor.clone();
+                // Re-planned rather than carried across the channel: the tree
+                // may have moved since the preview, and `apply` snapshots first
+                // so the action is itself reversible.
+                let applied = tokio::task::spawn_blocking(move || {
+                    let plan = s.plan(action, cursor.as_deref())?;
+                    let target = plan.target.sha.clone();
+                    s.apply(&plan).map(|(stat, safety)| (stat, target, safety))
+                })
+                .await;
+                match applied {
+                    Ok(Ok((stat, target, safety))) => {
+                        match action {
+                            crate::checkpoint::CheckpointAction::Undo => undo_cursor = Some(target),
+                            _ => undo_cursor = None,
+                        }
+                        let verb = match action {
+                            crate::checkpoint::CheckpointAction::Undo => "reverted",
+                            crate::checkpoint::CheckpointAction::Redo => "re-applied",
+                            crate::checkpoint::CheckpointAction::Restore(_) => "restored",
+                        };
+                        let summary = crate::checkpoint::render_stat(&stat, 10).join("\n");
+                        let undo_hint = safety
+                            .map(|id| format!("\n  (/restore {id} to put it back)"))
+                            .unwrap_or_default();
+                        ai_tx
+                            .send(AiEvent::Notice(format!("{verb}:\n{summary}{undo_hint}")))
+                            .ok();
+                    }
+                    Ok(Err(e)) => {
+                        ai_tx.send(AiEvent::Error(e.to_string())).ok();
+                    }
+                    Err(e) => {
+                        ai_tx.send(AiEvent::Error(format!("checkpoint: {e}"))).ok();
+                    }
+                }
+                continue;
+            }
             AgentCommand::MaxTurnsResponse(resp) => {
                 let Some(prompt) = pending_resume.take() else {
                     continue;
                 };
                 match resp {
                     None => {
+                        // No snapshot here: declining does no model work, and
+                        // the turn that hit the cap was snapshotted already.
                         let turn_start_idx = history.len();
                         let turn_started_at = epoch_secs();
                         history.push(prompt);
@@ -725,7 +745,6 @@ pub async fn run_agent(
                             &memory_db,
                             &config,
                             &current_model,
-                            checkpoint_enabled,
                             &ai_tx,
                             &hook_runner,
                             &tool_outcomes,
@@ -751,6 +770,7 @@ pub async fn run_agent(
                             n,
                         )
                         .await;
+                        let outcome = drive_outcome(&result);
                         finish_turn(
                             result,
                             &tool_records,
@@ -761,13 +781,22 @@ pub async fn run_agent(
                             &memory_db,
                             &config,
                             &current_model,
-                            checkpoint_enabled,
                             &ai_tx,
                             &hook_runner,
                             &tool_outcomes,
                             &session_id,
                             &mut turn_seq,
                         );
+                        snapshot_turn(
+                            &checkpoints,
+                            &ai_tx,
+                            outcome,
+                            &last_prompt_label,
+                            &current_model,
+                            turn_seq,
+                        )
+                        .await;
+                        undo_cursor = None;
                     }
                 }
                 continue;
@@ -846,6 +875,10 @@ pub async fn run_agent(
             AgentCommand::Message(msg) => msg,
         };
 
+        // Label this turn's checkpoint with the user's prompt, captured before
+        // memory context gets prepended to it.
+        last_prompt_label = message.clone();
+
         // A new message while a max-turns prompt is outstanding implicitly
         // declines it: stash the unsent prompt into history rather than
         // silently dropping it, then handle the new message normally.
@@ -898,6 +931,7 @@ pub async fn run_agent(
         )
         .await;
 
+        let outcome = drive_outcome(&result);
         finish_turn(
             result,
             &tool_records,
@@ -908,13 +942,23 @@ pub async fn run_agent(
             &memory_db,
             &config,
             &current_model,
-            checkpoint_enabled,
             &ai_tx,
             &hook_runner,
             &tool_outcomes,
             &session_id,
             &mut turn_seq,
         );
+        snapshot_turn(
+            &checkpoints,
+            &ai_tx,
+            outcome,
+            &last_prompt_label,
+            &current_model,
+            turn_seq,
+        )
+        .await;
+        // A fresh turn invalidates the undo cursor: /undo targets it next.
+        undo_cursor = None;
     }
 
     if let (Some(db), Some(id)) = (&memory_db, &session_id) {

@@ -173,8 +173,8 @@ pub struct Config {
     pub hooks: Vec<crate::hooks::HookConfig>,
     #[serde(default)]
     pub memory: MemoryConfig,
-    #[serde(default = "default_true")]
-    pub git_checkpointing: bool,
+    #[serde(default)]
+    pub checkpoints: CheckpointsConfig,
     #[serde(default)]
     pub quality: QualityConfig,
 }
@@ -239,6 +239,68 @@ pub struct QualityConfig {
     pub judge_model: Option<String>,
 }
 
+/// Per-turn snapshots of the working tree, kept in a shadow git repository
+/// outside the project so the user's own repository is never written to.
+#[derive(Debug, Deserialize, Clone)]
+pub struct CheckpointsConfig {
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    /// Overrides the auto-detected project root (the directory that gets
+    /// snapshotted). Rarely needed; `~` is expanded.
+    pub root: Option<String>,
+    /// Where the shadow repositories live. Defaults to
+    /// `$XDG_DATA_HOME/magai/checkpoints`.
+    pub store: Option<String>,
+    /// How many checkpoints to keep before the oldest are pruned.
+    #[serde(default = "default_keep")]
+    pub keep: usize,
+    /// Extra gitignore-style patterns excluded from snapshots.
+    #[serde(default)]
+    pub exclude: Vec<String>,
+    /// Whether to apply the built-in exclude list (build output, dependency
+    /// trees, editor junk). Matters most in projects with no `.gitignore`.
+    #[serde(default = "default_true")]
+    pub use_default_excludes: bool,
+    /// Whether to copy the project's `.git/info/exclude` into the shadow
+    /// repository, which cannot otherwise see it.
+    #[serde(default = "default_true")]
+    pub copy_project_exclude: bool,
+    /// Rows shown by `/checkpoints`.
+    #[serde(default = "default_max_list")]
+    pub max_list: usize,
+    /// Byte cap on the diff text `/diff` renders.
+    #[serde(default = "default_diff_bytes")]
+    pub diff_max_bytes: usize,
+}
+
+impl Default for CheckpointsConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            root: None,
+            store: None,
+            keep: default_keep(),
+            exclude: Vec::new(),
+            use_default_excludes: true,
+            copy_project_exclude: true,
+            max_list: default_max_list(),
+            diff_max_bytes: default_diff_bytes(),
+        }
+    }
+}
+
+fn default_keep() -> usize {
+    200
+}
+
+fn default_max_list() -> usize {
+    50
+}
+
+fn default_diff_bytes() -> usize {
+    20_000
+}
+
 impl Config {
     /// Loads the config, falling back to `Config::default()` on any read or
     /// parse error. The second element of the tuple carries a human-readable
@@ -270,6 +332,17 @@ impl Config {
         let nm = self.named_models.iter().find(|m| m.alias == alias)?;
         let pc = self.providers.get(&nm.provider)?;
         Some((nm, pc))
+    }
+}
+
+/// Expands a leading `~/` against `$HOME`. Any other path is returned as-is.
+pub fn expand_tilde(path: &str) -> String {
+    match path.strip_prefix("~/") {
+        Some(rest) => match std::env::var("HOME") {
+            Ok(home) => format!("{}/{rest}", home.trim_end_matches('/')),
+            Err(_) => path.to_string(),
+        },
+        None => path.to_string(),
     }
 }
 
@@ -379,6 +452,12 @@ mod tests {
         assert_eq!(cfg.permission_mode, PermissionMode::AskDangerous);
         assert_eq!(cfg.max_context_tokens, 80_000);
         assert_eq!(cfg.max_turns, 25);
+
+        // The [checkpoints] block is commented out in the example, so this
+        // pins the defaults a user gets without configuring anything.
+        assert!(cfg.checkpoints.enabled);
+        assert!(cfg.checkpoints.use_default_excludes);
+        assert_eq!(cfg.checkpoints.keep, 200);
 
         assert_eq!(cfg.providers.len(), 3);
         let openai = cfg.providers.get("openai").expect("openai provider");

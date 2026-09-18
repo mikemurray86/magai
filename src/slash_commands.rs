@@ -12,11 +12,14 @@ pub const COMMANDS: &[(&str, &str)] = &[
         "rate the last turn (good/bad/neutral) for fine-tuning data",
     ),
     (
-        "/squash",
-        "collapse checkpoint commits into one (optional message)",
+        "/restore",
+        "reset the whole tree to a checkpoint (/restore <n>)",
     ),
     ("/tools", "enable or disable tools (on/off)"),
-    ("/undo", "revert last agent turn (git reset --hard HEAD~1)"),
+    ("/undo", "revert the last agent turn's file changes"),
+    ("/redo", "re-apply the changes /undo reverted"),
+    ("/checkpoints", "list saved checkpoints for this project"),
+    ("/diff", "show what a turn changed (/diff [n])"),
     ("/quit", "quit the application"),
 ];
 
@@ -62,7 +65,12 @@ pub enum SlashCommandAction {
     SetTools(bool),
     Clear,
     Undo,
-    Squash(String),
+    Redo,
+    /// Reset the whole working tree to the given checkpoint id.
+    Restore(u64),
+    Checkpoints,
+    /// Show a checkpoint's diff; `None` means the most recent turn.
+    Diff(Option<u64>),
     ListModels(String),
     ShowMessage(String),
     ShowPlugins,
@@ -83,7 +91,27 @@ pub fn dispatch(input: &str, skills: &[crate::skills::Skill]) -> SlashCommandAct
         "/exit" | "/quit" => SlashCommandAction::Exit,
         "/clear" => SlashCommandAction::Clear,
         "/undo" => SlashCommandAction::Undo,
-        "/squash" => SlashCommandAction::Squash(arg.to_string()),
+        "/redo" => SlashCommandAction::Redo,
+        "/checkpoints" => SlashCommandAction::Checkpoints,
+        // A leading '#' is accepted because /checkpoints renders ids as "#42".
+        "/diff" => {
+            if arg.is_empty() {
+                SlashCommandAction::Diff(None)
+            } else {
+                match arg.trim_start_matches('#').parse::<u64>() {
+                    Ok(n) => SlashCommandAction::Diff(Some(n)),
+                    Err(_) => SlashCommandAction::ShowMessage(
+                        "usage: /diff [n]  (n from /checkpoints)".to_string(),
+                    ),
+                }
+            }
+        }
+        "/restore" => match arg.trim_start_matches('#').parse::<u64>() {
+            Ok(n) => SlashCommandAction::Restore(n),
+            Err(_) => SlashCommandAction::ShowMessage(
+                "usage: /restore <n>  (n from /checkpoints)".to_string(),
+            ),
+        },
         "/plugins" => SlashCommandAction::ShowPlugins,
         "/mcp" => SlashCommandAction::ShowMcp,
         "/model" => {
@@ -121,7 +149,9 @@ pub fn dispatch(input: &str, skills: &[crate::skills::Skill]) -> SlashCommandAct
             }
         }
         "/help" => SlashCommandAction::ShowMessage(
-            "/clear             —  clear conversation\n\
+            "/checkpoints       —  list saved checkpoints for this project\n\
+             /clear             —  clear conversation\n\
+             /diff [n]          —  show what a turn changed (default: the last)\n\
              /exit, /quit       —  quit the application\n\
              /help              —  show this message\n\
              /mcp               —  list configured MCP servers and their status\n\
@@ -130,9 +160,10 @@ pub fn dispatch(input: &str, skills: &[crate::skills::Skill]) -> SlashCommandAct
              /plugins           —  list loaded plugins\n\
              /provider <alias>  —  list all models offered by a provider\n\
              /rate good|bad|neutral [note] —  rate the last turn for fine-tuning data\n\
-             /squash [message]  —  collapse checkpoint commits; commits if message given\n\
+             /redo              —  re-apply the changes /undo reverted\n\
+             /restore <n>       —  reset the whole tree to checkpoint n\n\
              /tools on|off      —  enable or disable tools\n\
-             /undo              —  revert last agent turn (git reset --hard HEAD~1)"
+             /undo              —  revert the last agent turn's file changes"
                 .to_string(),
         ),
         _ => {
@@ -315,14 +346,49 @@ mod tests {
     }
 
     #[test]
-    fn dispatch_squash_with_and_without_message() {
-        match dispatch("/squash feat: add login", &[]) {
-            SlashCommandAction::Squash(msg) => assert_eq!(msg, "feat: add login"),
-            _ => panic!("expected Squash"),
+    fn dispatch_checkpoint_commands() {
+        assert!(matches!(dispatch("/undo", &[]), SlashCommandAction::Undo));
+        assert!(matches!(dispatch("/redo", &[]), SlashCommandAction::Redo));
+        assert!(matches!(
+            dispatch("/checkpoints", &[]),
+            SlashCommandAction::Checkpoints
+        ));
+    }
+
+    #[test]
+    fn dispatch_diff_argument_is_optional() {
+        assert!(matches!(
+            dispatch("/diff", &[]),
+            SlashCommandAction::Diff(None)
+        ));
+        assert!(matches!(
+            dispatch("/diff 7", &[]),
+            SlashCommandAction::Diff(Some(7))
+        ));
+        // /checkpoints renders ids as "#7", so pasting one back must work.
+        assert!(matches!(
+            dispatch("/diff #7", &[]),
+            SlashCommandAction::Diff(Some(7))
+        ));
+        match dispatch("/diff nonsense", &[]) {
+            SlashCommandAction::ShowMessage(m) => assert!(m.contains("usage: /diff")),
+            _ => panic!("expected a usage message"),
         }
-        match dispatch("/squash", &[]) {
-            SlashCommandAction::Squash(msg) => assert_eq!(msg, ""),
-            _ => panic!("expected Squash"),
+    }
+
+    #[test]
+    fn dispatch_restore_requires_an_id() {
+        assert!(matches!(
+            dispatch("/restore 3", &[]),
+            SlashCommandAction::Restore(3)
+        ));
+        assert!(matches!(
+            dispatch("/restore #3", &[]),
+            SlashCommandAction::Restore(3)
+        ));
+        match dispatch("/restore", &[]) {
+            SlashCommandAction::ShowMessage(m) => assert!(m.contains("usage: /restore")),
+            _ => panic!("expected a usage message"),
         }
     }
 

@@ -1,5 +1,6 @@
 mod ai;
 mod approval;
+mod checkpoint;
 mod cli;
 mod config;
 mod hooks;

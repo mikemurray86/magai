@@ -1,6 +1,6 @@
 //! Frame rendering: title/separator/history/input layout, chat-history line
 //! building, autocomplete popups (model/provider/slash-command/provider-model),
-//! and the tool-approval card.
+//! and the tool-approval and checkpoint-confirmation cards.
 
 use ratatui::{
     layout::{Constraint, Layout, Rect},
@@ -11,7 +11,7 @@ use ratatui::{
 };
 
 use super::text::{markdown_to_static_lines, word_wrap};
-use super::{App, Role};
+use super::{App, CheckpointPrompt, Role};
 
 impl App {
     pub(super) fn draw(&mut self, frame: &mut Frame) {
@@ -283,57 +283,9 @@ impl App {
             }
         }
 
-        // ── dirty workspace prompt card ───────────────────
-        if self.pending_dirty_workspace {
-            let card_w = (area.width.saturating_sub(8)).min(58);
-            let card_h = 5_u16;
-            let card_x = (area.width.saturating_sub(card_w)) / 2;
-            let card_y = (area.height.saturating_sub(card_h)) / 2;
-            let card_rect = Rect::new(card_x, card_y, card_w, card_h);
-            let card_lines = vec![
-                Line::from(Span::styled(
-                    "  Working tree has uncommitted changes.",
-                    Style::default().fg(Color::Yellow),
-                )),
-                Line::raw(""),
-                Line::from(vec![
-                    Span::raw("  "),
-                    Span::styled(
-                        " s ",
-                        Style::default()
-                            .fg(Color::Black)
-                            .bg(Color::Green)
-                            .add_modifier(Modifier::BOLD),
-                    ),
-                    Span::styled(
-                        " stash & enable undo    ",
-                        Style::default().fg(Color::Green),
-                    ),
-                    Span::styled(
-                        " c ",
-                        Style::default()
-                            .fg(Color::Black)
-                            .bg(Color::Yellow)
-                            .add_modifier(Modifier::BOLD),
-                    ),
-                    Span::styled(" continue without undo", Style::default().fg(Color::Yellow)),
-                ]),
-            ];
-            frame.render_widget(Clear, card_rect);
-            frame.render_widget(
-                Paragraph::new(card_lines).block(
-                    Block::new()
-                        .borders(Borders::ALL)
-                        .border_style(Style::default().fg(Color::Yellow))
-                        .title(Span::styled(
-                            " uncommitted changes ",
-                            Style::default()
-                                .fg(Color::Yellow)
-                                .add_modifier(Modifier::BOLD),
-                        )),
-                ),
-                card_rect,
-            );
+        // ── checkpoint confirmation card ───────────────────
+        if let Some(prompt) = &self.pending_checkpoint {
+            render_checkpoint_prompt(frame, area, prompt);
         }
 
         // ── max turns reached prompt card ───────────────────
@@ -487,6 +439,11 @@ impl App {
                         .fg(Color::Yellow)
                         .add_modifier(Modifier::DIM),
                 ),
+                Role::Diff => (
+                    "      ".into(),
+                    Style::default().fg(Color::DarkGray),
+                    Style::default().fg(Color::Gray),
+                ),
                 Role::ToolCall => (
                     String::from(" tool "),
                     Style::default()
@@ -506,6 +463,40 @@ impl App {
             let label_len = label.len();
             let content_w = (self.view_width as usize).saturating_sub(label_len).max(1);
             let cont_pad = " ".repeat(label_len);
+
+            if msg.role == Role::Diff {
+                // Truncate rather than wrap: a wrapped patch is unreadable, and
+                // the +/- column has to stay in place to mean anything.
+                for (i, raw) in msg.content.lines().enumerate() {
+                    let style = if raw.starts_with("+++") || raw.starts_with("---") {
+                        Style::default()
+                            .fg(Color::DarkGray)
+                            .add_modifier(Modifier::BOLD)
+                    } else if raw.starts_with("diff ") || raw.starts_with("index ") {
+                        Style::default().fg(Color::DarkGray)
+                    } else if raw.starts_with("@@") {
+                        Style::default().fg(Color::Cyan)
+                    } else if raw.starts_with('+') {
+                        Style::default().fg(Color::Green)
+                    } else if raw.starts_with('-') {
+                        Style::default().fg(Color::Red)
+                    } else {
+                        text_style
+                    };
+                    let cut = crate::ui::text::floor_char_boundary(raw, content_w);
+                    let prefix = if i == 0 {
+                        Span::styled(label.clone(), label_style)
+                    } else {
+                        Span::raw(cont_pad.clone())
+                    };
+                    lines.push(Line::from(vec![
+                        prefix,
+                        Span::styled(raw[..cut].to_string(), style),
+                    ]));
+                }
+                lines.push(Line::raw(""));
+                continue;
+            }
 
             if msg.role == Role::Assistant && !msg.content.is_empty() {
                 // Render with markdown
@@ -570,4 +561,104 @@ impl App {
 
         lines
     }
+}
+
+/// The confirmation card shown before an undo or restore touches any file.
+/// Height follows the content, since the stat block is variable-length.
+fn render_checkpoint_prompt(frame: &mut Frame, area: Rect, prompt: &CheckpointPrompt) {
+    let card_w = (area.width.saturating_sub(8)).min(72);
+    let inner_w = card_w.saturating_sub(4) as usize;
+
+    let mut card_lines: Vec<Line> = vec![
+        Line::from(Span::styled(
+            format!("  {}", truncate(&prompt.title, inner_w)),
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        )),
+        Line::raw(""),
+    ];
+
+    for line in &prompt.lines {
+        card_lines.push(Line::from(Span::styled(
+            truncate(line, inner_w),
+            Style::default().fg(Color::Gray),
+        )));
+    }
+    card_lines.push(Line::raw(""));
+
+    let (border, keys) = match &prompt.blocked {
+        Some(reason) => {
+            card_lines.insert(
+                2,
+                Line::from(Span::styled(
+                    format!("  {}", truncate(reason, inner_w)),
+                    Style::default().fg(Color::Red),
+                )),
+            );
+            card_lines.insert(3, Line::raw(""));
+            (
+                Color::Red,
+                Line::from(vec![
+                    Span::raw("  "),
+                    Span::styled(
+                        " esc ",
+                        Style::default()
+                            .fg(Color::Black)
+                            .bg(Color::Yellow)
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                    Span::styled(" dismiss", Style::default().fg(Color::Yellow)),
+                ]),
+            )
+        }
+        None => (
+            Color::Cyan,
+            Line::from(vec![
+                Span::raw("  "),
+                Span::styled(
+                    " y ",
+                    Style::default()
+                        .fg(Color::Black)
+                        .bg(Color::Green)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(" apply    ", Style::default().fg(Color::Green)),
+                Span::styled(
+                    " n ",
+                    Style::default()
+                        .fg(Color::Black)
+                        .bg(Color::Yellow)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(" cancel", Style::default().fg(Color::Yellow)),
+            ]),
+        ),
+    };
+    card_lines.push(keys);
+
+    let card_h = (card_lines.len() as u16 + 2).min(area.height);
+    let card_x = (area.width.saturating_sub(card_w)) / 2;
+    let card_y = (area.height.saturating_sub(card_h)) / 2;
+    let card_rect = Rect::new(card_x, card_y, card_w, card_h);
+
+    frame.render_widget(Clear, card_rect);
+    frame.render_widget(
+        Paragraph::new(card_lines).block(
+            Block::new()
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(border))
+                .title(Span::styled(
+                    " checkpoint ",
+                    Style::default().fg(border).add_modifier(Modifier::BOLD),
+                )),
+        ),
+        card_rect,
+    );
+}
+
+/// Width-safe truncation for card text, never splitting a codepoint.
+fn truncate(s: &str, max: usize) -> String {
+    let cut = crate::ui::text::floor_char_boundary(s, max);
+    s[..cut].to_string()
 }

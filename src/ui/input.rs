@@ -64,6 +64,17 @@ fn rate_turn(config: &crate::config::Config, turn_id: &str, verdict: &str, note:
 }
 
 impl App {
+    /// Checkpoint commands go to the agent task, which owns the store. While a
+    /// turn is streaming, `drive_stream` drops every non-approval command, so
+    /// refuse here instead of letting the command disappear silently.
+    fn send_checkpoint(&mut self, cmd: crate::ai::AgentCommand) {
+        if self.is_waiting {
+            self.push_system("busy — finish or cancel the turn first".to_string());
+            return;
+        }
+        self.user_tx.send(cmd).ok();
+    }
+
     fn handle_slash_command(&mut self, input: &str) {
         use crate::slash_commands::{dispatch, SlashCommandAction};
         match dispatch(input, &self.skills) {
@@ -88,12 +99,27 @@ impl App {
                 self.user_tx.send(crate::ai::AgentCommand::Clear).ok();
             }
             SlashCommandAction::Undo => {
-                self.user_tx.send(crate::ai::AgentCommand::Undo).ok();
+                self.send_checkpoint(crate::ai::AgentCommand::CheckpointPreview(
+                    crate::checkpoint::CheckpointAction::Undo,
+                ));
             }
-            SlashCommandAction::Squash(message) => {
-                self.user_tx
-                    .send(crate::ai::AgentCommand::Squash(message))
-                    .ok();
+            SlashCommandAction::Redo => {
+                // No confirmation card: a redo is already an explicit inverse
+                // of something the user just chose to undo.
+                self.send_checkpoint(crate::ai::AgentCommand::CheckpointApply(
+                    crate::checkpoint::CheckpointAction::Redo,
+                ));
+            }
+            SlashCommandAction::Restore(id) => {
+                self.send_checkpoint(crate::ai::AgentCommand::CheckpointPreview(
+                    crate::checkpoint::CheckpointAction::Restore(id),
+                ));
+            }
+            SlashCommandAction::Checkpoints => {
+                self.send_checkpoint(crate::ai::AgentCommand::CheckpointList);
+            }
+            SlashCommandAction::Diff(id) => {
+                self.send_checkpoint(crate::ai::AgentCommand::CheckpointDiff(id));
             }
             SlashCommandAction::ShowModel => {
                 self.push_system(format!("current model: {}", self.current_model));
@@ -278,20 +304,24 @@ impl App {
                         return Ok(());
                     }
 
-                    // Dirty workspace prompt intercepts s/c exclusively
-                    if self.pending_dirty_workspace {
+                    // Checkpoint confirmation intercepts y/n exclusively
+                    if let Some(prompt) = self.pending_checkpoint.clone() {
+                        // A blocked action can only be dismissed; Esc must
+                        // always work, since this block also swallows Ctrl+C.
+                        if prompt.blocked.is_some() {
+                            self.pending_checkpoint = None;
+                            return Ok(());
+                        }
                         match key.code {
-                            KeyCode::Char('s') | KeyCode::Char('S') => {
+                            KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => {
                                 self.user_tx
-                                    .send(crate::ai::AgentCommand::DirtyWorkspaceResponse(true))
+                                    .send(crate::ai::AgentCommand::CheckpointApply(prompt.action))
                                     .ok();
-                                self.pending_dirty_workspace = false;
+                                self.pending_checkpoint = None;
                             }
-                            KeyCode::Char('c') | KeyCode::Char('C') => {
-                                self.user_tx
-                                    .send(crate::ai::AgentCommand::DirtyWorkspaceResponse(false))
-                                    .ok();
-                                self.pending_dirty_workspace = false;
+                            KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
+                                self.pending_checkpoint = None;
+                                self.push_system("cancelled".to_string());
                             }
                             _ => {}
                         }

@@ -16,9 +16,10 @@ yours to configure.
 - **You stay in control.** An approval gate prompts before dangerous actions
   (writing files, editing files, running shell commands) — configurable from
   "ask for everything" to "just do it."
-- **A safety net is built in.** Before each turn, magai stashes your working
-  tree (`git stash --include-untracked`) so a bad agent edit is always one
-  `/undo` away.
+- **A safety net is built in.** magai snapshots your working tree after every
+  turn, so a bad agent edit is always one `/undo` away — and `/diff` shows you
+  exactly what changed. Snapshots live outside your repository, so magai never
+  commits, stashes, or stages anything on your behalf.
 - **Extensible.** Add custom `/slash-command` skills, hooks that fire shell
   commands on lifecycle events (session start/stop, tool calls, responses),
   plugins that bundle skills + hooks + an MCP server together, and connect to

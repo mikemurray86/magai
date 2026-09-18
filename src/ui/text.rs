@@ -155,7 +155,7 @@ pub(super) fn summarize_result(result: &str) -> String {
 }
 
 /// Largest byte index `<= index` that lies on a UTF-8 char boundary in `s`.
-fn floor_char_boundary(s: &str, index: usize) -> usize {
+pub(crate) fn floor_char_boundary(s: &str, index: usize) -> usize {
     if index >= s.len() {
         return s.len();
     }

@@ -5,7 +5,7 @@
 
 mod input;
 mod render;
-mod text;
+pub(crate) mod text;
 
 use ratatui::{
     style::{Color, Modifier, Style},
@@ -21,6 +21,9 @@ pub enum AiEvent {
     Token(String),
     Done,
     Error(String),
+    /// An informational success message. `Error` is for failures only — it
+    /// used to carry both, so successful undos rendered as errors.
+    Notice(String),
     ModelList {
         provider: String,
         models: Vec<String>,
@@ -47,7 +50,18 @@ pub enum AiEvent {
         turns_dropped: usize,
     },
     HistoryCleared,
-    DirtyWorkspacePrompt,
+    /// Rendered `/checkpoints` table.
+    CheckpointList(String),
+    /// Unified diff text for `/diff`, rendered without markdown.
+    CheckpointDiff(String),
+    /// A destructive checkpoint action awaiting confirmation. `blocked` is
+    /// `Some(reason)` when it cannot proceed.
+    CheckpointPreview {
+        action: crate::checkpoint::CheckpointAction,
+        title: String,
+        lines: Vec<String>,
+        blocked: Option<String>,
+    },
     MaxTurnsReached {
         max_turns: usize,
     },
@@ -59,11 +73,24 @@ pub enum AiEvent {
     },
 }
 
+/// A destructive checkpoint action waiting on the user's confirmation.
+#[derive(Debug, Clone)]
+pub(super) struct CheckpointPrompt {
+    pub action: crate::checkpoint::CheckpointAction,
+    pub title: String,
+    pub lines: Vec<String>,
+    /// When set, the action cannot proceed and the card only dismisses.
+    pub blocked: Option<String>,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 enum Role {
     User,
     Assistant,
     System,
+    /// A unified diff: rendered one source line per row, truncated rather than
+    /// wrapped, and coloured by leading character.
+    Diff,
     ToolCall,
     ToolResult,
 }
@@ -111,7 +138,7 @@ pub struct App {
     cmd_ac_idx: Option<usize>,
     provider_models: Option<(String, Vec<String>)>,
     provider_model_sel: usize,
-    pending_dirty_workspace: bool,
+    pending_checkpoint: Option<CheckpointPrompt>,
     pending_max_turns: Option<usize>,
     max_turns_input: String,
     last_turn_id: Option<String>,
@@ -157,7 +184,7 @@ impl App {
             cmd_ac_idx: None,
             provider_models: None,
             provider_model_sel: 0,
-            pending_dirty_workspace: false,
+            pending_checkpoint: None,
             pending_max_turns: None,
             max_turns_input: String::new(),
             last_turn_id: None,
@@ -293,8 +320,28 @@ impl App {
                 AiEvent::McpStatus(report) => {
                     self.push_system(report);
                 }
-                AiEvent::DirtyWorkspacePrompt => {
-                    self.pending_dirty_workspace = true;
+                AiEvent::Notice(msg) => {
+                    self.push_system(msg);
+                }
+                AiEvent::CheckpointList(report) => {
+                    self.push_system(report);
+                }
+                AiEvent::CheckpointDiff(text) => {
+                    self.push_diff(text);
+                }
+                AiEvent::CheckpointPreview {
+                    action,
+                    title,
+                    lines,
+                    blocked,
+                } => {
+                    self.pending_checkpoint = Some(CheckpointPrompt {
+                        action,
+                        title,
+                        lines,
+                        blocked,
+                    });
+                    self.auto_scroll = true;
                 }
                 AiEvent::MaxTurnsReached { max_turns } => {
                     self.is_waiting = false;
@@ -369,6 +416,19 @@ impl App {
     fn push_system(&mut self, content: String) {
         self.messages.push(ChatMessage {
             role: Role::System,
+            content,
+            model_name: None,
+            call_id: None,
+            elapsed_ms: None,
+        });
+        self.auto_scroll = true;
+    }
+
+    /// Pushes raw diff text, which renders unwrapped and coloured rather than
+    /// word-wrapped like an ordinary system message.
+    fn push_diff(&mut self, content: String) {
+        self.messages.push(ChatMessage {
+            role: Role::Diff,
             content,
             model_name: None,
             call_id: None,

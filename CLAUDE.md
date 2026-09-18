@@ -186,8 +186,44 @@ receives `&preamble` (and, if it should support per-model overrides,
 `&project_ctx` plus a `find_named_model` lookup) so project instructions
 stay in effect.
 
-### Git safety net
+### Checkpoints (`checkpoint.rs`, `checkpoint/{parse,format}.rs`)
 
-If the working directory is a git repo, `git_checkpoint` stashes
-(`git stash push --include-untracked`) before each agent turn, and `/undo`
-runs `git stash pop` — this is how the agent's file edits can be reverted.
+Per-turn snapshots of the working tree, kept in a **shadow git repository**
+under `$XDG_DATA_HOME/magai/checkpoints/<slug>/git`. Every git call passes
+`--git-dir=<shadow> --work-tree=<project>`, so the user's own repository is
+never read or written — no commits, no index, no HEAD, no stash, no reflog, no
+hooks, no signing. Checkpointing therefore works on a dirty tree, alongside the
+user's own commits, and in directories that are not git repos at all. Because
+snapshots capture the *tree* rather than tool calls, `shell_command` writes are
+covered as well as `write_file`/`edit_file`.
+
+`CheckpointStore::snapshot` runs `add -A` → `write-tree` → `commit-tree` →
+`update-ref` on `refs/heads/magai`. Plumbing rather than `git commit`: it runs
+no hooks, honours no `commit.gpgsign`, and needs no HEAD. A snapshot whose tree
+matches the previous one is skipped, so a turn that changed nothing leaves no
+row behind. Metadata rides in the commit message as `Magai-*` trailers (id,
+kind, outcome, model, turn, session), which is why there is no sidecar file to
+fall out of sync; ids are monotonic so pruning never renumbers survivors.
+
+Snapshots are taken at session start, **after every turn whatever the
+`DriveResult`** (`snapshot_turn` in `ai.rs` — `Done`-only was the bug that made
+`/undo` revert the wrong turn after a Ctrl-C), and before every destructive
+action so that action is itself reversible.
+
+`/undo` is surgical: it reverse-applies just that turn's patch via
+`git apply --reverse --check` then `--reverse`. Files the user edited during the
+turn are untouched, and a genuine collision fails the `--check` so nothing is
+written. `--3way` is deliberately not used — it implies `--index` and leaves
+conflict markers instead of refusing. `/restore` is `read-tree -u --reset` plus
+`clean -fdq`, never `reset --hard`, which would move the branch and break the
+append-only log that lets `/redo` survive a `/restore`.
+
+Two traps encoded in the code: `slug_for` hand-rolls FNV-1a because
+`DefaultHasher` is not stable across Rust releases (a changed hash orphans every
+existing checkpoint), and `CheckpointStore::command` scrubs `GIT_DIR` and
+friends from the environment so magai launched from a git hook cannot have its
+snapshots redirected into the user's repo.
+
+The shadow's `info/attributes` (`* -text -filter …`) is load-bearing: without
+`-filter`, snapshots in a git-lfs project store pointers and a restore smudges
+garbage into the working tree.
