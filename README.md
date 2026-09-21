@@ -37,20 +37,44 @@ The binary is at `target/release/magai`.
 
 ### 2. Get a model running
 
-The simplest path is [Ollama](https://ollama.com) — no API key needed:
+Pick either path — magai needs no config file for either.
+
+**A hosted provider.** Export an API key and magai picks it up:
+
+```sh
+export ANTHROPIC_API_KEY=sk-...   # or OPENAI_API_KEY, or GROQ_API_KEY
+```
+
+**Local, via [Ollama](https://ollama.com).** No API key needed:
 
 ```sh
 ollama pull granite4:latest
 ```
 
-magai will use this as the default if you don't configure anything else.
+With no `default_model` configured, magai uses the first `[[named_models]]`
+entry whose credentials are actually present. If nothing names a model, magai
+will not guess one — it finds a usable provider (a configured one, else
+`ANTHROPIC_API_KEY` / `OPENAI_API_KEY` / `GROQ_API_KEY`, else Ollama), lists
+that provider's models, and asks you to pick:
 
-To use a hosted provider instead (OpenAI, Anthropic, Groq), export the
-relevant API key as an environment variable, e.g.:
-
-```sh
-export ANTHROPIC_API_KEY=sk-...
 ```
+$ magai
+error: ANTHROPIC_API_KEY is set, but no model is chosen and magai will not guess one.
+
+  Models from "anthropic" (9 available, newest first):
+    claude-opus-5
+    ...
+
+  Set default_model in ~/.config/magai/config.toml, or add a [[named_models]] entry.
+```
+
+If that lookup fails, magai reports why. The whole choice is validated before
+the TUI opens, so a missing key or an unreachable Ollama exits with a message
+rather than starting a session that fails on every turn. Switch models at any
+time with `/model` and `/provider`.
+
+For an Ollama instance that isn't on `http://localhost:11434`, set
+`OLLAMA_API_BASE_URL` or `[providers.ollama].base_url` in the config.
 
 ### 3. (Optional) configure
 

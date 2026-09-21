@@ -16,18 +16,170 @@ use tokio::sync::mpsc;
 
 use crate::approval::{ApprovalGate, GateContext, ToolOutcomeCounter};
 use crate::checkpoint::{CheckpointStore, SnapshotMeta};
-use crate::config::{Config, ProviderType};
+use crate::config::{Config, ProviderType, StartupChoice};
 use crate::hooks::{HookEvent, HookRunner};
 use crate::memory::{default_db_path, MemoryDb, ToolCallRecord};
 use crate::ui::AiEvent;
 
 use providers::{
-    api_key_from_env, build_anthropic, build_ollama, build_openai, fetch_models, resolve_agent,
-    DynAgent,
+    api_key_from_env, build_startup_agent, fetch_models, fetch_models_for, fetch_ollama_models,
+    gemini_unsupported, ollama_base_url, resolve_agent, DynAgent,
 };
 use stream::{drive_stream, DriveResult};
 
-pub const DEFAULT_MODEL: &str = "granite4:latest";
+/// How to rebuild the current agent when only the tool server changes.
+/// Deliberately separate from the `current_model` display string: after
+/// `/provider` that string is `provider/model`, which matches no
+/// `[[named_models]]` alias and used to fall through to Ollama.
+enum ModelSelection {
+    /// A `[[named_models]]` alias, re-resolved so its `system_prompt` override
+    /// keeps applying.
+    Alias(String),
+    Direct(crate::config::StartupModel),
+}
+
+/// Decides — and validates — which model magai will start with, before the
+/// TUI takes over the terminal. Errors are returned so `main` can print them
+/// to stderr and exit, rather than opening an alternate screen that hides
+/// them behind a session that fails on every turn.
+pub async fn preflight_startup(config: &Config) -> Result<crate::config::StartupModel, String> {
+    match config.startup_choice(&|k| std::env::var(k).ok())? {
+        StartupChoice::Model(startup) => validate_model(config, startup).await,
+        // A provider is reachable but nothing named a model. Report what it
+        // actually offers rather than guessing an id: a guess goes stale, may
+        // not exist on the account, and can silently land on a model that is
+        // not even a chat model.
+        StartupChoice::NeedsModel(unresolved) => {
+            let models = fetch_models_for(&unresolved.provider, config)
+                .await
+                .map_err(|e| lookup_failed_message(&unresolved, &e))?;
+            Err(needs_model_message(&unresolved, &models))
+        }
+    }
+}
+
+/// Confirms a chosen model can actually be used, before the TUI hides stderr.
+async fn validate_model(
+    config: &Config,
+    startup: crate::config::StartupModel,
+) -> Result<crate::config::StartupModel, String> {
+    match startup.provider_type {
+        ProviderType::Gemini => return Err(gemini_unsupported()),
+        // A key that is missing now would only surface as an auth failure on
+        // the first turn, so check it here. No network call.
+        ProviderType::OpenAI | ProviderType::Anthropic | ProviderType::Groq => {
+            api_key_from_env(startup.api_key_env.as_deref()).map_err(|e| {
+                format!(
+                    "model {:?} cannot be used: {e}. Export the key, or set \
+                     default_model to a model whose credentials are available.",
+                    startup.display
+                )
+            })?;
+        }
+        ProviderType::Ollama => {
+            let base = ollama_base_url(config, startup.base_url.as_deref());
+            let tags = fetch_ollama_models(&base)
+                .await
+                .map_err(|e| ollama_unreachable_message(&base, &e))?;
+            if let Some(warning) = reconcile_ollama_model(&startup, &tags, &base)? {
+                eprintln!("warning: {warning}");
+            }
+        }
+    }
+    Ok(startup)
+}
+
+/// How many catalogue entries to print before summarising the rest. Enough to
+/// recognise a model, short enough to stay readable against an aggregator that
+/// lists several hundred.
+const MODEL_LIST_LIMIT: usize = 20;
+
+fn needs_model_message(
+    unresolved: &crate::config::UnresolvedProvider,
+    models: &[String],
+) -> String {
+    let label = &unresolved.label;
+    // Hosted catalogues carry a creation date and are sorted by it; Ollama
+    // tags are just what is installed locally, so claim no order for them.
+    let ordering = match unresolved.provider.provider_type {
+        ProviderType::Ollama => "installed",
+        _ => "available, newest first",
+    };
+    if models.is_empty() {
+        return format!(
+            "{}, and provider {label:?} reports no models to choose from.\n  \
+             Check the account, or configure a different provider.",
+            unresolved.detected_via
+        );
+    }
+    let shown: Vec<String> = models
+        .iter()
+        .take(MODEL_LIST_LIMIT)
+        .map(|m| format!("    {m}"))
+        .collect();
+    let rest = models.len().saturating_sub(shown.len());
+    let more = if rest > 0 {
+        format!("\n    ... {rest} more")
+    } else {
+        String::new()
+    };
+    format!(
+        "{}, but no model is chosen and magai will not guess one.\n\n  \
+         Models from {label:?} ({} {ordering}):\n{}{more}\n\n  \
+         Set default_model in ~/.config/magai/config.toml, or add a \
+         [[named_models]] entry.",
+        unresolved.detected_via,
+        models.len(),
+        shown.join("\n"),
+    )
+}
+
+fn lookup_failed_message(unresolved: &crate::config::UnresolvedProvider, err: &str) -> String {
+    format!(
+        "{}, but magai could not list its models to choose from: {err}\n  \
+         Set default_model in ~/.config/magai/config.toml to name a model \
+         directly, or fix access to provider {:?}.",
+        unresolved.detected_via, unresolved.label
+    )
+}
+
+/// Reconciles the chosen Ollama model against the tags the server actually
+/// holds. The choice is always kept — magai never substitutes a different
+/// model — but a tag the server does not list earns a warning, since the user
+/// may simply be about to pull it. Returns the warning text, if any.
+fn reconcile_ollama_model(
+    startup: &crate::config::StartupModel,
+    tags: &[String],
+    base: &str,
+) -> Result<Option<String>, String> {
+    if tags.is_empty() {
+        return Err(format!(
+            "ollama at {base} has no models — run `ollama pull <model>`, \
+             or configure a hosted provider."
+        ));
+    }
+    if tags.contains(&startup.model) {
+        return Ok(None);
+    }
+    Ok(Some(format!(
+        "ollama at {base} does not list {:?} (has: {}). Continuing anyway — \
+         run `ollama pull {}` if turns fail.",
+        startup.model,
+        tags.join(", "),
+        startup.model
+    )))
+}
+
+fn ollama_unreachable_message(base: &str, err: &str) -> String {
+    format!(
+        "the configured model needs ollama, but it is not reachable ({err}).\n  \
+         Start it with `ollama serve`, point magai at another instance with \
+         OLLAMA_API_BASE_URL or [providers.ollama].base_url in \
+         ~/.config/magai/config.toml,\n  \
+         or use a hosted provider by exporting ANTHROPIC_API_KEY, \
+         OPENAI_API_KEY or GROQ_API_KEY.\n  Tried: {base}"
+    )
+}
 
 /// The default system preamble, kept in its own file so it's easy to read
 /// and tweak without wading through `ai.rs`. Per-model overrides (see
@@ -318,8 +470,9 @@ fn finish_turn(
             if !text.is_empty() {
                 let db = Arc::clone(db);
                 let alias = current_model.to_string();
+                let base_url = config.ollama_base_url();
                 tokio::spawn(crate::memory::extract::extract_facts_async(
-                    db, text, model, alias,
+                    db, text, model, alias, base_url,
                 ));
             }
         }
@@ -359,12 +512,14 @@ fn finish_turn(
                 if outcome == "done" && !assistant_text.is_empty() {
                     if let Some(judge_model) = config.quality.judge_model.clone() {
                         let db = Arc::clone(db);
+                        let base_url = config.ollama_base_url();
                         tokio::spawn(crate::memory::quality::judge_turn_async(
                             db,
                             turn_id,
                             judge_model,
                             user_text,
                             assistant_text,
+                            base_url,
                         ));
                     }
                 }
@@ -392,6 +547,7 @@ pub async fn run_agent(
     mut user_rx: mpsc::UnboundedReceiver<AgentCommand>,
     ai_tx: mpsc::UnboundedSender<AiEvent>,
     config: Config,
+    startup: crate::config::StartupModel,
 ) {
     // Discover plugins and merge their resources with config-level resources
     let plugins = crate::plugins::discover();
@@ -433,19 +589,10 @@ pub async fn run_agent(
                     .await
                     .ok();
                 tool_handle
-                    .add_tool(
-                        gate_ctx.wrap(
-                            crate::tools::MemorySave::new(
-                                db.clone(),
-                                config
-                                    .default_model
-                                    .as_deref()
-                                    .unwrap_or(DEFAULT_MODEL)
-                                    .to_string(),
-                            ),
-                            false,
-                        ),
-                    )
+                    .add_tool(gate_ctx.wrap(
+                        crate::tools::MemorySave::new(db.clone(), startup.display.clone()),
+                        false,
+                    ))
                     .await
                     .ok();
                 Some(db)
@@ -485,23 +632,37 @@ pub async fn run_agent(
     };
 
     let mut tools_enabled = true;
-    let startup = config.default_model.as_deref().unwrap_or(DEFAULT_MODEL);
 
-    let (mut agent, mut current_model) =
-        match resolve_agent(startup, &config, &preamble, &project_ctx, ts(tools_enabled)) {
-            Ok(pair) => pair,
-            Err(_) => match build_ollama(DEFAULT_MODEL, &preamble, Some(tool_handle.clone())) {
-                Ok(agent) => (agent, DEFAULT_MODEL.to_string()),
-                Err(e) => {
-                    ai_tx
-                        .send(AiEvent::Error(format!(
-                            "startup: could not initialize any model agent: {e}"
-                        )))
-                        .ok();
-                    return;
-                }
-            },
-        };
+    // `startup` was already resolved and validated by `preflight_startup`
+    // before the TUI opened, so there is no second-chance fallback here: a
+    // failure now means something changed underneath us, and silently
+    // substituting a different provider is exactly the behaviour being removed.
+    let (mut agent, mut current_model) = match build_startup_agent(
+        &startup,
+        &config,
+        &preamble,
+        &project_ctx,
+        ts(tools_enabled),
+    ) {
+        Ok(pair) => pair,
+        Err(e) => {
+            ai_tx
+                .send(AiEvent::Error(format!(
+                    "startup: could not initialize model {:?}: {e}",
+                    startup.display
+                )))
+                .ok();
+            return;
+        }
+    };
+    // What to rebuild from when only the tool server changes. Derived from the
+    // choice itself, never re-parsed from `current_model`: that display string
+    // is `provider/model` after `/provider`, which matches no alias and used to
+    // send `/tools on|off` straight back to Ollama.
+    let mut selection = match &startup.alias {
+        Some(alias) => ModelSelection::Alias(alias.clone()),
+        None => ModelSelection::Direct(startup.clone()),
+    };
 
     hook_runner.fire(
         HookEvent::SessionStart,
@@ -579,6 +740,7 @@ pub async fn run_agent(
                     Ok((new_agent, display)) => {
                         agent = new_agent;
                         current_model = display;
+                        selection = ModelSelection::Alias(alias);
                     }
                     Err(e) => {
                         ai_tx.send(AiEvent::Error(e)).ok();
@@ -588,14 +750,22 @@ pub async fn run_agent(
             }
             AgentCommand::SetTools(enabled) => {
                 tools_enabled = enabled;
-                match resolve_agent(
-                    &current_model,
-                    &config,
-                    &preamble,
-                    &project_ctx,
-                    ts(tools_enabled),
-                ) {
-                    Ok((new_agent, _)) => agent = new_agent,
+                let rebuilt = match &selection {
+                    ModelSelection::Alias(alias) => {
+                        resolve_agent(alias, &config, &preamble, &project_ctx, ts(tools_enabled))
+                            .map(|(a, _)| a)
+                    }
+                    ModelSelection::Direct(startup) => build_startup_agent(
+                        startup,
+                        &config,
+                        &preamble,
+                        &project_ctx,
+                        ts(tools_enabled),
+                    )
+                    .map(|(a, _)| a),
+                };
+                match rebuilt {
+                    Ok(new_agent) => agent = new_agent,
                     Err(e) => {
                         ai_tx.send(AiEvent::Error(e)).ok();
                     }
@@ -833,34 +1003,47 @@ pub async fn run_agent(
                 provider_alias,
                 model_id,
             } => {
-                let result = if let Some(pc) = config.providers.get(&provider_alias) {
-                    match pc.provider_type {
-                        ProviderType::OpenAI | ProviderType::Groq => {
-                            api_key_from_env(pc.api_key_env.as_deref()).and_then(|k| {
-                                build_openai(
-                                    &model_id,
-                                    &k,
-                                    pc.base_url.as_deref(),
-                                    &preamble,
-                                    ts(tools_enabled),
-                                )
-                            })
-                        }
-                        ProviderType::Anthropic => api_key_from_env(pc.api_key_env.as_deref())
-                            .and_then(|k| {
-                                build_anthropic(&model_id, &k, &preamble, ts(tools_enabled))
-                            }),
-                        ProviderType::Ollama | ProviderType::Gemini => {
-                            build_ollama(&model_id, &preamble, ts(tools_enabled))
-                        }
+                // Describe the pick structurally so `/tools on|off` can rebuild
+                // it later without re-parsing the `provider/model` label.
+                let picked = match config.providers.get(&provider_alias) {
+                    Some(pc) => Ok(crate::config::StartupModel {
+                        display: format!("{provider_alias}/{model_id}"),
+                        alias: None,
+                        provider_type: pc.provider_type,
+                        model: model_id.clone(),
+                        api_key_env: pc.api_key_env.clone(),
+                        base_url: pc.base_url.clone(),
+                    }),
+                    None if provider_alias == "ollama" && config.ollama_is_available() => {
+                        Ok(crate::config::StartupModel {
+                            display: format!("{provider_alias}/{model_id}"),
+                            alias: None,
+                            provider_type: ProviderType::Ollama,
+                            model: model_id.clone(),
+                            api_key_env: None,
+                            base_url: None,
+                        })
                     }
-                } else {
-                    build_ollama(&model_id, &preamble, ts(tools_enabled))
+                    None => Err(format!(
+                        "no provider configured for '{provider_alias}'. Configured: {}",
+                        config.provider_names().join(", ")
+                    )),
                 };
+                let result = picked.and_then(|startup| {
+                    build_startup_agent(
+                        &startup,
+                        &config,
+                        &preamble,
+                        &project_ctx,
+                        ts(tools_enabled),
+                    )
+                    .map(|(a, display)| (a, display, startup))
+                });
                 match result {
-                    Ok(new_agent) => {
+                    Ok((new_agent, display, startup)) => {
                         agent = new_agent;
-                        current_model = format!("{provider_alias}/{model_id}");
+                        current_model = display;
+                        selection = ModelSelection::Direct(startup);
                     }
                     Err(e) => {
                         ai_tx.send(AiEvent::Error(e)).ok();
@@ -969,4 +1152,65 @@ pub async fn run_agent(
         HookEvent::SessionStop,
         HashMap::from([("MAGAI_MODEL".to_string(), current_model.clone())]),
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::StartupModel;
+
+    fn ollama_choice(model: &str) -> StartupModel {
+        StartupModel {
+            display: model.to_string(),
+            alias: None,
+            provider_type: ProviderType::Ollama,
+            model: model.to_string(),
+            api_key_env: None,
+            base_url: None,
+        }
+    }
+
+    fn tags(names: &[&str]) -> Vec<String> {
+        names.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn reconcile_keeps_a_model_the_server_has() {
+        let m = ollama_choice("granite4:latest");
+        let warning =
+            reconcile_ollama_model(&m, &tags(&["llama3.2:latest", "granite4:latest"]), "u")
+                .unwrap();
+        assert!(warning.is_none());
+        assert_eq!(m.model, "granite4:latest");
+    }
+
+    #[test]
+    fn reconcile_never_substitutes_a_different_model() {
+        // magai reports and warns, but the model the user named is the model
+        // that runs — silently swapping in another is the behaviour this
+        // whole path exists to remove.
+        let m = ollama_choice("granite4:latest");
+        let warning = reconcile_ollama_model(&m, &tags(&["llama3.2:latest"]), "u")
+            .unwrap()
+            .expect("a tag the server lacks should warn");
+        assert!(warning.contains("granite4:latest"), "{warning}");
+        assert_eq!(m.model, "granite4:latest");
+    }
+
+    #[test]
+    fn reconcile_warns_but_keeps_an_explicit_model() {
+        let m = ollama_choice("qwen3:8b");
+        let warning = reconcile_ollama_model(&m, &tags(&["llama3.2:latest"]), "u")
+            .unwrap()
+            .expect("an explicit miss should warn");
+        assert!(warning.contains("qwen3:8b"), "{warning}");
+        assert_eq!(m.model, "qwen3:8b", "an explicit choice is never swapped");
+    }
+
+    #[test]
+    fn reconcile_rejects_a_server_with_no_models() {
+        let m = ollama_choice("granite4:latest");
+        let err = reconcile_ollama_model(&m, &[], "http://h:11434").unwrap_err();
+        assert!(err.contains("ollama pull"), "{err}");
+    }
 }

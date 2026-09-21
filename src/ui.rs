@@ -149,6 +149,7 @@ impl App {
         user_tx: mpsc::UnboundedSender<crate::ai::AgentCommand>,
         ai_rx: mpsc::UnboundedReceiver<AiEvent>,
         config: crate::config::Config,
+        current_model: String,
     ) -> Self {
         let plugins = crate::plugins::discover();
         let plugin_skills = crate::plugins::extract_skills(&plugins);
@@ -167,10 +168,7 @@ impl App {
             view_height: 24,
             view_width: 80,
             auto_scroll: true,
-            current_model: config
-                .default_model
-                .clone()
-                .unwrap_or_else(|| crate::ai::DEFAULT_MODEL.to_string()),
+            current_model,
             pending_approval: None,
             pending_model: None,
             input_history: Vec::new(),
@@ -387,11 +385,9 @@ impl App {
         let Some(partial) = first_line.strip_prefix("/provider ") else {
             return vec![];
         };
-        let mut names: Vec<String> = self.config.providers.keys().cloned().collect();
-        if !names.iter().any(|n| n == "ollama") {
-            names.push("ollama".to_string());
-        }
-        names.sort();
+        // Already sorted, and includes "ollama" only where it is the implicit
+        // provider — it used to be advertised even in hosted-only configs.
+        let mut names = self.config.provider_names();
         names.retain(|n| n.starts_with(partial));
         names
     }

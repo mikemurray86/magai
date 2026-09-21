@@ -163,7 +163,7 @@ fn epoch_secs() -> i64 {
 }
 
 /// Fire-and-forget LLM-based fact extraction. Calls the Ollama generate
-/// endpoint with `model`, parses the JSON triple array from the response, and
+/// endpoint at `base_url` with `model`, parses the JSON triple array from the response, and
 /// stores each triple as a `Fact` node. Runs in a spawned task; all errors are
 /// silently swallowed so a bad model response never interrupts the agent.
 pub async fn extract_facts_async(
@@ -171,6 +171,7 @@ pub async fn extract_facts_async(
     text: String,
     model: String,
     session_alias: String,
+    base_url: String,
 ) {
     let prompt = format!(
         "Extract factual claims from the text below as a JSON array. \
@@ -181,9 +182,12 @@ pub async fn extract_facts_async(
          Respond with valid JSON only, no other text.\n\nText:\n{text}\n\nJSON:"
     );
 
-    let client = reqwest::Client::new();
+    let client = reqwest::Client::builder()
+        .connect_timeout(std::time::Duration::from_secs(2))
+        .build()
+        .unwrap_or_default();
     let Ok(resp) = client
-        .post("http://localhost:11434/api/generate")
+        .post(format!("{base_url}/api/generate"))
         .json(&serde_json::json!({
             "model": model,
             "prompt": prompt,

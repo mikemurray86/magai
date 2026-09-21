@@ -40,9 +40,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .send(AiEvent::Error(format!("config: {warning}")))
             .ok();
     }
-    tokio::spawn(ai::run_agent(user_rx, ai_tx, cfg.clone()));
+    // Resolve and validate the startup model *before* the alternate screen
+    // takes over: a missing API key or an absent Ollama used to open a TUI
+    // that looked healthy and failed on every turn, with stderr hidden.
+    let startup = match ai::preflight_startup(&cfg).await {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("error: {e}");
+            std::process::exit(1);
+        }
+    };
 
-    let app = ui::App::new(user_tx, ai_rx, cfg);
+    let model_label = startup.display.clone();
+    tokio::spawn(ai::run_agent(user_rx, ai_tx, cfg.clone(), startup));
+
+    let app = ui::App::new(user_tx, ai_rx, cfg, model_label);
     tokio::task::block_in_place(|| {
         let mut terminal = ratatui::init();
         execute!(std::io::stdout(), EnableMouseCapture).ok();

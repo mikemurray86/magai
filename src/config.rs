@@ -2,7 +2,7 @@ use serde::Deserialize;
 use std::collections::HashMap;
 use std::path::PathBuf;
 
-#[derive(Debug, Deserialize, Clone, PartialEq)]
+#[derive(Debug, Deserialize, Clone, Copy, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum ProviderType {
     Ollama,
@@ -12,7 +12,88 @@ pub enum ProviderType {
     Gemini,
 }
 
-#[derive(Debug, Deserialize, Clone)]
+impl ProviderType {
+    /// The name this type is spelled with in `type = "..."`, reused for the
+    /// `provider/model` labels shown in the TUI.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Ollama => "ollama",
+            Self::OpenAI => "openai",
+            Self::Anthropic => "anthropic",
+            Self::Groq => "groq",
+            Self::Gemini => "gemini",
+        }
+    }
+}
+
+/// Where Ollama lives when nothing says otherwise.
+pub const OLLAMA_DEFAULT_BASE_URL: &str = "http://localhost:11434";
+
+/// The environment variable rig itself honours — but only in
+/// `ProviderClient::from_env()`, which magai never calls.
+pub const OLLAMA_BASE_URL_ENV: &str = "OLLAMA_API_BASE_URL";
+
+/// Providers magai can detect from the environment when none are configured,
+/// in precedence order. Deliberately only the env var that proves a provider
+/// is usable, and no model id: magai does not guess which model to run, since
+/// a baked-in id goes stale and may not exist on the account. The provider's
+/// own catalogue is listed instead, and the user picks.
+pub const AUTODETECT: &[(ProviderType, &str)] = &[
+    (ProviderType::Anthropic, "ANTHROPIC_API_KEY"),
+    (ProviderType::OpenAI, "OPENAI_API_KEY"),
+    (ProviderType::Groq, "GROQ_API_KEY"),
+];
+
+/// Resolves the Ollama endpoint: `[providers.<ollama>].base_url` →
+/// `$OLLAMA_API_BASE_URL` → [`OLLAMA_DEFAULT_BASE_URL`].
+///
+/// The trailing `/` is trimmed because rig's `build_uri` appends `"/" + path`
+/// unconditionally — `"http://h:11434/"` would otherwise produce
+/// `"http://h:11434//api/chat"`.
+pub fn ollama_base_url_from(configured: Option<&str>, env: Option<&str>) -> String {
+    let raw = configured
+        .filter(|s| !s.trim().is_empty())
+        .or(env.filter(|s| !s.trim().is_empty()))
+        .unwrap_or(OLLAMA_DEFAULT_BASE_URL);
+    raw.trim().trim_end_matches('/').to_string()
+}
+
+/// What magai decided to start with. `alias` is `Some` only when the choice
+/// came from a `[[named_models]]` entry, so `resolve_agent` can still apply
+/// that entry's `system_prompt`/`system_prompt_file` override.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StartupModel {
+    /// The label shown in the TUI.
+    pub display: String,
+    pub alias: Option<String>,
+    pub provider_type: ProviderType,
+    pub model: String,
+    pub api_key_env: Option<String>,
+    pub base_url: Option<String>,
+}
+
+/// The outcome of startup resolution. magai never picks a model on the user's
+/// behalf: when nothing names one, it reports the provider's catalogue and
+/// stops, rather than guessing an id that may be stale, absent from the
+/// account, or unsuited to the work.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StartupChoice {
+    Model(StartupModel),
+    NeedsModel(UnresolvedProvider),
+}
+
+/// A provider magai can reach, but with no model chosen for it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnresolvedProvider {
+    /// Name used in messages: the `[providers.*]` key, or the provider type
+    /// when it was detected from the environment rather than configured.
+    pub label: String,
+    pub provider: ProviderConfig,
+    /// How magai arrived here, quoted in the error so the cause is obvious.
+    pub detected_via: String,
+}
+
+#[derive(Debug, Deserialize, Clone, PartialEq, Eq)]
 pub struct ProviderConfig {
     #[serde(rename = "type")]
     pub provider_type: ProviderType,
@@ -333,6 +414,243 @@ impl Config {
         let pc = self.providers.get(&nm.provider)?;
         Some((nm, pc))
     }
+
+    /// The first `[providers.*]` entry with `type = "ollama"`. Keys are sorted
+    /// so a `HashMap`'s iteration order cannot make the choice flap between
+    /// runs when several ollama providers are configured.
+    pub fn ollama_provider(&self) -> Option<(&str, &ProviderConfig)> {
+        let mut keys: Vec<&String> = self
+            .providers
+            .iter()
+            .filter(|(_, pc)| pc.provider_type == ProviderType::Ollama)
+            .map(|(k, _)| k)
+            .collect();
+        keys.sort();
+        let key = keys.first()?;
+        Some((key.as_str(), self.providers.get(*key)?))
+    }
+
+    /// Whether a bare model id may be read as an Ollama tag: either an ollama
+    /// provider is configured, or nothing is configured at all (the
+    /// zero-config case magai has always supported). A user who configured
+    /// providers and deliberately left Ollama out never gets one invented.
+    pub fn ollama_is_available(&self) -> bool {
+        self.providers.is_empty() || self.ollama_provider().is_some()
+    }
+
+    /// Where Ollama lives, honouring config then environment.
+    pub fn ollama_base_url(&self) -> String {
+        ollama_base_url_from(
+            self.ollama_provider()
+                .and_then(|(_, pc)| pc.base_url.as_deref()),
+            std::env::var(OLLAMA_BASE_URL_ENV).ok().as_deref(),
+        )
+    }
+
+    /// Provider keys the UI may offer for `/provider`, sorted, with `"ollama"`
+    /// included only when it is the implicit fallback rather than something
+    /// the user configured away.
+    pub fn provider_names(&self) -> Vec<String> {
+        let mut names: Vec<String> = self.providers.keys().cloned().collect();
+        if self.providers.is_empty() {
+            names.push("ollama".to_string());
+        }
+        names.sort();
+        names
+    }
+
+    /// Decides which model magai starts with, without touching the network.
+    /// `env` is the environment lookup (`&|k| std::env::var(k).ok()` in
+    /// production) so the whole precedence ladder is unit-testable without
+    /// mutating the process environment.
+    ///
+    /// Precedence:
+    ///
+    /// 1. `default_model`, if set. The user was explicit, so a mismatch is an
+    ///    error rather than a substitution — silent substitution is the bug
+    ///    class this whole path exists to remove. A bare value is still read
+    ///    as an Ollama tag when `ollama_is_available()`.
+    /// 2. Otherwise the first `[[named_models]]` entry that is actually
+    ///    usable: its provider key resolves, and for a hosted provider its
+    ///    `api_key_env` is present in `env`. This is what makes one shared
+    ///    config work on machines that export different keys.
+    /// 3. Otherwise a provider is *identified* but no model is chosen, and
+    ///    [`StartupChoice::NeedsModel`] is returned so the caller can list
+    ///    that provider's catalogue and stop. In order: a configured provider
+    ///    whose credentials are present, then an [`AUTODETECT`] row whose env
+    ///    var is set, then Ollama.
+    ///
+    /// Rung 3 never invents a model id. A baked-in default goes stale, may not
+    /// exist on the account, and silently picking one from a catalogue is how
+    /// you end up running an image or embedding model as a coding agent.
+    pub fn startup_choice(
+        &self,
+        env: &dyn Fn(&str) -> Option<String>,
+    ) -> Result<StartupChoice, String> {
+        if let Some(alias) = self.default_model.as_deref() {
+            return self
+                .startup_from_default_model(alias)
+                .map(StartupChoice::Model);
+        }
+
+        if !self.named_models.is_empty() {
+            if let Some(m) = self
+                .named_models
+                .iter()
+                .find_map(|nm| self.usable_named_model(nm, env))
+            {
+                return Ok(StartupChoice::Model(m));
+            }
+            return Err(self.no_usable_named_model_message());
+        }
+
+        // Providers configured but no `[[named_models]]` to pick from: offer
+        // the first usable one's catalogue. Sorted so the choice is stable.
+        let mut keys: Vec<&String> = self.providers.keys().collect();
+        keys.sort();
+        for key in keys {
+            let pc = &self.providers[key];
+            let usable = pc.provider_type == ProviderType::Ollama
+                || pc
+                    .api_key_env
+                    .as_deref()
+                    .and_then(env)
+                    .is_some_and(|v| !v.is_empty());
+            if usable {
+                return Ok(StartupChoice::NeedsModel(UnresolvedProvider {
+                    label: key.clone(),
+                    provider: pc.clone(),
+                    detected_via: format!("provider {key:?} is configured"),
+                }));
+            }
+        }
+
+        for (provider_type, key_env) in AUTODETECT {
+            if env(key_env).is_some_and(|v| !v.is_empty()) {
+                return Ok(StartupChoice::NeedsModel(UnresolvedProvider {
+                    label: provider_type.as_str().to_string(),
+                    provider: ProviderConfig {
+                        provider_type: *provider_type,
+                        api_key_env: Some((*key_env).to_string()),
+                        base_url: None,
+                    },
+                    detected_via: format!("{key_env} is set"),
+                }));
+            }
+        }
+
+        Ok(StartupChoice::NeedsModel(UnresolvedProvider {
+            label: "ollama".to_string(),
+            provider: ProviderConfig {
+                provider_type: ProviderType::Ollama,
+                api_key_env: None,
+                base_url: self
+                    .ollama_provider()
+                    .and_then(|(_, pc)| pc.base_url.clone()),
+            },
+            detected_via: "no provider API keys were found, so magai fell back to ollama"
+                .to_string(),
+        }))
+    }
+
+    fn startup_from_default_model(&self, alias: &str) -> Result<StartupModel, String> {
+        if let Some((nm, pc)) = self.find_named_model(alias) {
+            return Ok(StartupModel {
+                display: alias.to_string(),
+                alias: Some(alias.to_string()),
+                provider_type: pc.provider_type,
+                model: nm.model.clone(),
+                api_key_env: pc.api_key_env.clone(),
+                base_url: pc.base_url.clone(),
+            });
+        }
+        // A named model whose `provider` key has no `[providers.*]` entry also
+        // lands here. Say so specifically — it used to become an Ollama tag.
+        if let Some(nm) = self.named_models.iter().find(|m| m.alias == alias) {
+            return Err(format!(
+                "named model {alias:?} references provider {:?}, which has no \
+                 [providers.{}] entry in the config",
+                nm.provider, nm.provider
+            ));
+        }
+        if self.ollama_is_available() {
+            return Ok(StartupModel {
+                display: alias.to_string(),
+                alias: None,
+                provider_type: ProviderType::Ollama,
+                model: alias.to_string(),
+                api_key_env: None,
+                base_url: self
+                    .ollama_provider()
+                    .and_then(|(_, pc)| pc.base_url.clone()),
+            });
+        }
+        Err(format!(
+            "default_model {alias:?} names no [[named_models]] entry. Configured \
+             aliases: {}. Add an entry for it, or set default_model to one of \
+             those.",
+            self.alias_list()
+        ))
+    }
+
+    /// `Some` when this entry's provider resolves and its credentials are
+    /// present; `None` when it should be skipped in favour of a later entry.
+    fn usable_named_model(
+        &self,
+        nm: &NamedModel,
+        env: &dyn Fn(&str) -> Option<String>,
+    ) -> Option<StartupModel> {
+        let pc = self.providers.get(&nm.provider)?;
+        let credentialed = match pc.provider_type {
+            ProviderType::Ollama => true,
+            _ => pc
+                .api_key_env
+                .as_deref()
+                .and_then(env)
+                .is_some_and(|v| !v.is_empty()),
+        };
+        credentialed.then(|| StartupModel {
+            display: nm.alias.clone(),
+            alias: Some(nm.alias.clone()),
+            provider_type: pc.provider_type,
+            model: nm.model.clone(),
+            api_key_env: pc.api_key_env.clone(),
+            base_url: pc.base_url.clone(),
+        })
+    }
+
+    fn alias_list(&self) -> String {
+        if self.named_models.is_empty() {
+            return "(none)".to_string();
+        }
+        self.named_models
+            .iter()
+            .map(|m| m.alias.as_str())
+            .collect::<Vec<_>>()
+            .join(", ")
+    }
+
+    fn no_usable_named_model_message(&self) -> String {
+        let details: Vec<String> = self
+            .named_models
+            .iter()
+            .map(|nm| match self.providers.get(&nm.provider) {
+                None => format!("{}: provider {:?} is not configured", nm.alias, nm.provider),
+                Some(pc) => match pc.api_key_env.as_deref() {
+                    Some(var) => format!("{}: {var} is not set", nm.alias),
+                    None => format!(
+                        "{}: provider {:?} has no api_key_env",
+                        nm.alias, nm.provider
+                    ),
+                },
+            })
+            .collect();
+        format!(
+            "no usable model: every [[named_models]] entry is missing its \
+             credentials or provider ({})",
+            details.join("; ")
+        )
+    }
 }
 
 /// Expands a leading `~/` against `$HOME`. Any other path is returned as-is.
@@ -442,6 +760,313 @@ mod tests {
         assert_eq!(expand_env("plain"), "plain");
         // an unterminated `${` is left alone rather than eating the rest
         assert_eq!(expand_env("a ${oops"), "a ${oops");
+    }
+
+    /// Builds an environment lookup from a list of pairs, so the precedence
+    /// ladder can be tested without mutating the real process environment.
+    fn env_of<'a>(pairs: &'a [(&'a str, &'a str)]) -> impl Fn(&str) -> Option<String> + 'a {
+        move |k| {
+            pairs
+                .iter()
+                .find(|(name, _)| *name == k)
+                .map(|(_, v)| (*v).to_string())
+        }
+    }
+
+    /// Unwraps a resolution that should have produced a concrete model.
+    fn model_of(c: StartupChoice) -> StartupModel {
+        match c {
+            StartupChoice::Model(m) => m,
+            StartupChoice::NeedsModel(u) => {
+                panic!(
+                    "expected a model, got a prompt to pick one from {:?}",
+                    u.label
+                )
+            }
+        }
+    }
+
+    /// Unwraps a resolution that should have asked the user to pick.
+    fn needs_of(c: StartupChoice) -> UnresolvedProvider {
+        match c {
+            StartupChoice::NeedsModel(u) => u,
+            StartupChoice::Model(m) => panic!("expected a prompt to pick, got {:?}", m.display),
+        }
+    }
+
+    const TWO_PROVIDERS: &str = r#"
+        [providers.ollama]
+        type = "ollama"
+
+        [providers.anthropic]
+        type = "anthropic"
+        api_key_env = "ANTHROPIC_API_KEY"
+
+        [[named_models]]
+        alias = "local"
+        provider = "ollama"
+        model = "granite4:latest"
+
+        [[named_models]]
+        alias = "sonnet"
+        provider = "anthropic"
+        model = "claude-sonnet-5"
+    "#;
+
+    #[test]
+    fn ollama_base_url_prefers_config_then_env_then_default() {
+        assert_eq!(
+            ollama_base_url_from(Some("http://a:1"), Some("http://b:2")),
+            "http://a:1"
+        );
+        assert_eq!(ollama_base_url_from(None, Some("http://b:2")), "http://b:2");
+        assert_eq!(ollama_base_url_from(None, None), OLLAMA_DEFAULT_BASE_URL);
+        // an empty value is not a choice
+        assert_eq!(
+            ollama_base_url_from(Some("  "), None),
+            OLLAMA_DEFAULT_BASE_URL
+        );
+    }
+
+    #[test]
+    fn ollama_base_url_trims_trailing_slash() {
+        // rig's `build_uri` appends "/" + path unconditionally, so a trailing
+        // slash here would produce "http://h:11434//api/tags".
+        assert_eq!(
+            ollama_base_url_from(Some("http://h:11434/"), None),
+            "http://h:11434"
+        );
+    }
+
+    #[test]
+    fn ollama_is_available_only_when_implicit_or_configured() {
+        let empty: Config = toml::from_str("").unwrap();
+        assert!(empty.ollama_is_available(), "zero-config implies ollama");
+
+        let with_ollama: Config = toml::from_str(TWO_PROVIDERS).unwrap();
+        assert!(with_ollama.ollama_is_available());
+
+        let hosted_only: Config = toml::from_str(
+            r#"
+            [providers.anthropic]
+            type = "anthropic"
+            api_key_env = "ANTHROPIC_API_KEY"
+            "#,
+        )
+        .unwrap();
+        assert!(
+            !hosted_only.ollama_is_available(),
+            "a config that deliberately omits ollama should not get one invented"
+        );
+    }
+
+    #[test]
+    fn provider_names_omits_implicit_ollama_when_providers_configured() {
+        let hosted_only: Config = toml::from_str(
+            r#"
+            [providers.anthropic]
+            type = "anthropic"
+            "#,
+        )
+        .unwrap();
+        assert_eq!(hosted_only.provider_names(), vec!["anthropic".to_string()]);
+
+        let empty: Config = toml::from_str("").unwrap();
+        assert_eq!(empty.provider_names(), vec!["ollama".to_string()]);
+    }
+
+    #[test]
+    fn startup_prefers_explicit_default_model_alias() {
+        let mut cfg: Config = toml::from_str(TWO_PROVIDERS).unwrap();
+        cfg.default_model = Some("sonnet".into());
+        let m = model_of(cfg.startup_choice(&env_of(&[])).unwrap());
+        assert_eq!(m.alias.as_deref(), Some("sonnet"));
+        assert_eq!(m.provider_type, ProviderType::Anthropic);
+        assert_eq!(m.model, "claude-sonnet-5");
+        // an explicit alias wins even with no credentials present — the
+        // preflight reports that separately rather than substituting
+        assert_eq!(m.api_key_env.as_deref(), Some("ANTHROPIC_API_KEY"));
+    }
+
+    #[test]
+    fn startup_unknown_default_model_is_an_ollama_tag_when_ollama_available() {
+        let mut cfg: Config = toml::from_str(TWO_PROVIDERS).unwrap();
+        cfg.default_model = Some("qwen3:8b".into());
+        let m = model_of(cfg.startup_choice(&env_of(&[])).unwrap());
+        assert_eq!(m.provider_type, ProviderType::Ollama);
+        assert_eq!(m.model, "qwen3:8b");
+        assert!(m.alias.is_none());
+    }
+
+    #[test]
+    fn startup_unknown_default_model_errors_when_ollama_absent() {
+        let cfg: Config = toml::from_str(
+            r#"
+            default_model = "typo"
+
+            [providers.anthropic]
+            type = "anthropic"
+            api_key_env = "ANTHROPIC_API_KEY"
+
+            [[named_models]]
+            alias = "sonnet"
+            provider = "anthropic"
+            model = "claude-sonnet-5"
+            "#,
+        )
+        .unwrap();
+        let err = cfg.startup_choice(&env_of(&[])).unwrap_err();
+        assert!(err.contains("typo"), "error should name the alias: {err}");
+        assert!(
+            err.contains("sonnet"),
+            "error should list real aliases: {err}"
+        );
+    }
+
+    #[test]
+    fn startup_named_model_with_missing_provider_errors() {
+        let cfg: Config = toml::from_str(
+            r#"
+            default_model = "sonnet"
+
+            [providers.anthropic]
+            type = "anthropic"
+            api_key_env = "ANTHROPIC_API_KEY"
+
+            [[named_models]]
+            alias = "sonnet"
+            provider = "anthropik"
+            model = "claude-sonnet-5"
+            "#,
+        )
+        .unwrap();
+        // This used to silently become an Ollama tag named "sonnet".
+        let err = cfg.startup_choice(&env_of(&[])).unwrap_err();
+        assert!(
+            err.contains("anthropik"),
+            "error should name the provider: {err}"
+        );
+    }
+
+    #[test]
+    fn startup_falls_back_to_first_credentialed_named_model() {
+        let cfg: Config = toml::from_str(
+            r#"
+            [providers.openai]
+            type = "openai"
+            api_key_env = "OPENAI_API_KEY"
+
+            [providers.groq]
+            type = "groq"
+            api_key_env = "GROQ_API_KEY"
+
+            [[named_models]]
+            alias = "gpt"
+            provider = "openai"
+            model = "gpt-4o"
+
+            [[named_models]]
+            alias = "fast"
+            provider = "groq"
+            model = "llama-3.3-70b-versatile"
+            "#,
+        )
+        .unwrap();
+        // The first entry is skipped because its key is absent, so one shared
+        // config works on a machine that only exports GROQ_API_KEY.
+        let m = model_of(
+            cfg.startup_choice(&env_of(&[("GROQ_API_KEY", "k")]))
+                .unwrap(),
+        );
+        assert_eq!(m.alias.as_deref(), Some("fast"));
+    }
+
+    #[test]
+    fn startup_errors_when_named_models_exist_but_no_credentials() {
+        let cfg: Config = toml::from_str(
+            r#"
+            [providers.openai]
+            type = "openai"
+            api_key_env = "OPENAI_API_KEY"
+
+            [[named_models]]
+            alias = "gpt"
+            provider = "openai"
+            model = "gpt-4o"
+            "#,
+        )
+        .unwrap();
+        let err = cfg.startup_choice(&env_of(&[])).unwrap_err();
+        assert!(
+            err.contains("OPENAI_API_KEY"),
+            "error should name the var: {err}"
+        );
+    }
+
+    #[test]
+    fn startup_autodetects_provider_from_env_in_priority_order() {
+        let cfg: Config = toml::from_str("").unwrap();
+        let both = needs_of(
+            cfg.startup_choice(&env_of(&[
+                ("OPENAI_API_KEY", "k"),
+                ("ANTHROPIC_API_KEY", "k"),
+            ]))
+            .unwrap(),
+        );
+        assert_eq!(both.provider.provider_type, ProviderType::Anthropic);
+
+        let groq = needs_of(
+            cfg.startup_choice(&env_of(&[("GROQ_API_KEY", "k")]))
+                .unwrap(),
+        );
+        assert_eq!(groq.provider.provider_type, ProviderType::Groq);
+        assert!(
+            groq.detected_via.contains("GROQ_API_KEY"),
+            "the message should name what was detected: {}",
+            groq.detected_via
+        );
+    }
+
+    #[test]
+    fn startup_never_invents_a_model_id() {
+        // A detected provider says which catalogue to list, never which model
+        // to run: a baked-in id goes stale and may not exist on the account.
+        let cfg: Config = toml::from_str("").unwrap();
+        let u = needs_of(
+            cfg.startup_choice(&env_of(&[("ANTHROPIC_API_KEY", "k")]))
+                .unwrap(),
+        );
+        assert_eq!(u.label, "anthropic");
+        assert_eq!(u.provider.api_key_env.as_deref(), Some("ANTHROPIC_API_KEY"));
+    }
+
+    #[test]
+    fn startup_offers_a_configured_provider_when_no_named_models() {
+        let cfg: Config = toml::from_str(
+            r#"
+            [providers.openrouter]
+            type = "openai"
+            api_key_env = "OPENROUTER_API_KEY"
+            "#,
+        )
+        .unwrap();
+        let u = needs_of(
+            cfg.startup_choice(&env_of(&[("OPENROUTER_API_KEY", "k")]))
+                .unwrap(),
+        );
+        assert_eq!(u.label, "openrouter");
+    }
+
+    #[test]
+    fn startup_falls_back_to_ollama_last_without_choosing_a_tag() {
+        let cfg: Config = toml::from_str("").unwrap();
+        let u = needs_of(cfg.startup_choice(&env_of(&[])).unwrap());
+        assert_eq!(u.provider.provider_type, ProviderType::Ollama);
+        assert!(
+            u.detected_via.contains("no provider API keys"),
+            "{}",
+            u.detected_via
+        );
     }
 
     #[test]

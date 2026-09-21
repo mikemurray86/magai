@@ -3,8 +3,22 @@
 
 # ── Top-level settings ───────────────────────────────────────────────────────
 
-# Which model alias to use on startup (must match a [[named_models]] entry
-# below). Falls back to "granite4:latest" via Ollama if omitted or not found.
+# Which model alias to use on startup — a [[named_models]] alias from below.
+# An unknown value is an error, not a fallback: magai will not quietly start a
+# different model than the one you named. (The exception: when an ollama
+# provider is configured, or nothing is, an unknown value is read as a raw
+# Ollama tag such as "qwen3:8b".)
+#
+# If omitted, magai uses the first [[named_models]] entry whose credentials are
+# actually present (so one shared config works on machines that export
+# different keys). If no entry names a model, magai does NOT guess one: it
+# identifies a usable provider — a configured one, else ANTHROPIC_API_KEY /
+# OPENAI_API_KEY / GROQ_API_KEY, else Ollama — lists that provider's models,
+# and asks you to pick. If that lookup fails, it reports why.
+#
+# The choice is validated before the TUI opens, so a missing API key or an
+# unreachable Ollama exits with a message instead of starting a session that
+# fails on every turn.
 default_model = "local"
 
 # Controls when magai asks before executing a tool call.
@@ -28,8 +42,13 @@ max_turns = 25
 # is referenced by `provider` in [[named_models]] entries.
 # Supported types: ollama, openai, anthropic, groq, gemini
 
+# Configuring an `ollama` provider here (or configuring no providers at all)
+# is also what lets a bare model id be read as an Ollama tag.
 [providers.ollama]
 type = "ollama"
+# Where the Ollama server lives. Defaults to http://localhost:11434; the
+# $OLLAMA_API_BASE_URL environment variable is honoured when this is unset.
+# base_url = "http://localhost:11434"
 
 [providers.openai]
 type = "openai"
@@ -141,7 +160,9 @@ model = "claude-sonnet-4-5"
 #
 # When set, also asks this Ollama model to judge each finished turn
 # ("good"/"bad"/"neutral" + a short rationale), stored alongside any manual
-# /rate rating. Adds a background HTTP call per turn — omit to disable.
+# /rate rating. Adds a background HTTP call per turn — omit to disable. Uses
+# the endpoint from [providers.ollama].base_url / $OLLAMA_API_BASE_URL, and is
+# a silent no-op if that endpoint is unreachable.
 # judge_model = "granite4:latest"
 
 

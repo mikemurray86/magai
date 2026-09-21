@@ -142,7 +142,7 @@ fn epoch_secs() -> i64 {
 }
 
 /// Fire-and-forget LLM-as-judge rating of a finished turn. Calls the Ollama
-/// generate endpoint with `judge_model`, parses a JSON verdict object out of
+/// generate endpoint at `base_url` with `judge_model`, parses a JSON verdict object out of
 /// the response, and stores it as a `turn_ratings` row with `source =
 /// "judge"`. Runs in a spawned task; all errors are silently swallowed so a
 /// bad model response never interrupts the agent.
@@ -152,6 +152,7 @@ pub async fn judge_turn_async(
     judge_model: String,
     user_text: String,
     assistant_text: String,
+    base_url: String,
 ) {
     let prompt = format!(
         "Judge the quality of the following AI coding-agent response to a user \
@@ -163,9 +164,12 @@ pub async fn judge_turn_async(
          User request:\n{user_text}\n\nAssistant response:\n{assistant_text}\n\nJSON:"
     );
 
-    let client = reqwest::Client::new();
+    let client = reqwest::Client::builder()
+        .connect_timeout(std::time::Duration::from_secs(2))
+        .build()
+        .unwrap_or_default();
     let Ok(resp) = client
-        .post("http://localhost:11434/api/generate")
+        .post(format!("{base_url}/api/generate"))
         .json(&serde_json::json!({
             "model": judge_model,
             "prompt": prompt,
