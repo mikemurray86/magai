@@ -63,6 +63,12 @@ api_key_env = "ANTHROPIC_API_KEY"
 # type = "openai"
 # api_key_env = "PROXY_API_KEY"
 # base_url = "http://localhost:8080/v1"
+# Wire API for openai-type providers: "chat" (/chat/completions, the default
+# and what every compatible server speaks) or "responses" (/responses).
+# Some newer OpenAI models only accept the Responses API, including when
+# reached through a proxy such as LiteLLM. A [[named_models]] entry can set
+# its own `api` to override this for just that model.
+# api = "responses"
 
 
 # ── Named models ──────────────────────────────────────────────────────────────
@@ -101,6 +107,14 @@ model = "claude-sonnet-4-5"
 # provider = "proxy"
 # model = "mistral-7b"
 # system_prompt_file = ".magai/prompts/proxy-agent.md"
+
+# A Responses-only model behind the same proxy: `api` overrides the
+# provider's default for just this model.
+# [[named_models]]
+# alias = "gpt5-proxy"
+# provider = "proxy"
+# model = "gpt-5.6-sol"
+# api = "responses"
 
 
 # ── Checkpoints ──────────────────────────────────────────────────────────────

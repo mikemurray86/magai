@@ -1013,6 +1013,7 @@ pub async fn run_agent(
                         model: model_id.clone(),
                         api_key_env: pc.api_key_env.clone(),
                         base_url: pc.base_url.clone(),
+                        api: pc.api,
                     }),
                     None if provider_alias == "ollama" && config.ollama_is_available() => {
                         Ok(crate::config::StartupModel {
@@ -1022,6 +1023,7 @@ pub async fn run_agent(
                             model: model_id.clone(),
                             api_key_env: None,
                             base_url: None,
+                            api: Default::default(),
                         })
                     }
                     None => Err(format!(
@@ -1167,6 +1169,7 @@ mod tests {
             model: model.to_string(),
             api_key_env: None,
             base_url: None,
+            api: Default::default(),
         }
     }
 

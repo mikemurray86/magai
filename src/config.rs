@@ -26,6 +26,19 @@ impl ProviderType {
     }
 }
 
+/// Which OpenAI wire API an `openai`-type provider is spoken to over.
+/// `chat` (`/chat/completions`) is what every OpenAI-compatible server
+/// implements; `responses` (`/responses`) is required by some newer OpenAI
+/// models, which reject Chat Completions outright — including when reached
+/// through a proxy such as LiteLLM. Ignored for non-OpenAI provider types.
+#[derive(Debug, Deserialize, Clone, Copy, PartialEq, Eq, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum OpenAIApi {
+    #[default]
+    Chat,
+    Responses,
+}
+
 /// Where Ollama lives when nothing says otherwise.
 pub const OLLAMA_DEFAULT_BASE_URL: &str = "http://localhost:11434";
 
@@ -70,6 +83,7 @@ pub struct StartupModel {
     pub model: String,
     pub api_key_env: Option<String>,
     pub base_url: Option<String>,
+    pub api: OpenAIApi,
 }
 
 /// The outcome of startup resolution. magai never picks a model on the user's
@@ -99,6 +113,9 @@ pub struct ProviderConfig {
     pub provider_type: ProviderType,
     pub api_key_env: Option<String>,
     pub base_url: Option<String>,
+    /// The default OpenAI wire API for this provider's models.
+    #[serde(default)]
+    pub api: OpenAIApi,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -114,9 +131,18 @@ pub struct NamedModel {
     /// whose contents replace the default preamble when this model is
     /// active. Ignored if `system_prompt` is also set.
     pub system_prompt_file: Option<String>,
+    /// Overrides the provider's `api` for just this model, so one proxy can
+    /// serve both Chat Completions and Responses-only models.
+    pub api: Option<OpenAIApi>,
 }
 
 impl NamedModel {
+    /// The OpenAI wire API to use for this model: its own `api`, else the
+    /// provider's.
+    pub fn api(&self, pc: &ProviderConfig) -> OpenAIApi {
+        self.api.unwrap_or(pc.api)
+    }
+
     /// Reads this model's custom system prompt, if configured. `system_prompt`
     /// wins over `system_prompt_file`; returns `Ok(None)` when neither is set.
     pub fn resolve_system_prompt(&self) -> Result<Option<String>, String> {
@@ -533,6 +559,7 @@ impl Config {
                         provider_type: *provider_type,
                         api_key_env: Some((*key_env).to_string()),
                         base_url: None,
+                        api: OpenAIApi::default(),
                     },
                     detected_via: format!("{key_env} is set"),
                 }));
@@ -547,6 +574,7 @@ impl Config {
                 base_url: self
                     .ollama_provider()
                     .and_then(|(_, pc)| pc.base_url.clone()),
+                api: OpenAIApi::default(),
             },
             detected_via: "no provider API keys were found, so magai fell back to ollama"
                 .to_string(),
@@ -562,6 +590,7 @@ impl Config {
                 model: nm.model.clone(),
                 api_key_env: pc.api_key_env.clone(),
                 base_url: pc.base_url.clone(),
+                api: nm.api(pc),
             });
         }
         // A named model whose `provider` key has no `[providers.*]` entry also
@@ -583,6 +612,7 @@ impl Config {
                 base_url: self
                     .ollama_provider()
                     .and_then(|(_, pc)| pc.base_url.clone()),
+                api: OpenAIApi::default(),
             });
         }
         Err(format!(
@@ -616,6 +646,7 @@ impl Config {
             model: nm.model.clone(),
             api_key_env: pc.api_key_env.clone(),
             base_url: pc.base_url.clone(),
+            api: nm.api(pc),
         })
     }
 
@@ -1103,6 +1134,7 @@ mod tests {
             model: "m".to_string(),
             system_prompt: Some("inline prompt".to_string()),
             system_prompt_file: Some("/nonexistent/path/does-not-matter".to_string()),
+            api: None,
         };
         assert_eq!(
             nm.resolve_system_prompt().unwrap().as_deref(),
@@ -1124,6 +1156,7 @@ mod tests {
             model: "m".to_string(),
             system_prompt: None,
             system_prompt_file: Some(path.to_string_lossy().to_string()),
+            api: None,
         };
         assert_eq!(
             nm.resolve_system_prompt().unwrap().as_deref(),
@@ -1134,6 +1167,40 @@ mod tests {
     }
 
     #[test]
+    fn named_model_api_overrides_provider_api() {
+        let config: Config = toml::from_str(
+            r#"
+            [providers.proxy]
+            type = "openai"
+            base_url = "http://localhost:4000/v1"
+            api = "responses"
+
+            [[named_models]]
+            alias = "inherits"
+            provider = "proxy"
+            model = "a"
+
+            [[named_models]]
+            alias = "overrides"
+            provider = "proxy"
+            model = "b"
+            api = "chat"
+            "#,
+        )
+        .unwrap();
+        let (nm, pc) = config.find_named_model("inherits").unwrap();
+        assert_eq!(nm.api(pc), OpenAIApi::Responses);
+        let (nm, pc) = config.find_named_model("overrides").unwrap();
+        assert_eq!(nm.api(pc), OpenAIApi::Chat);
+    }
+
+    #[test]
+    fn provider_api_defaults_to_chat() {
+        let pc: ProviderConfig = toml::from_str(r#"type = "openai""#).unwrap();
+        assert_eq!(pc.api, OpenAIApi::Chat);
+    }
+
+    #[test]
     fn resolve_system_prompt_none_when_unset() {
         let nm = NamedModel {
             alias: "a".to_string(),
@@ -1141,6 +1208,7 @@ mod tests {
             model: "m".to_string(),
             system_prompt: None,
             system_prompt_file: None,
+            api: None,
         };
         assert_eq!(nm.resolve_system_prompt().unwrap(), None);
     }

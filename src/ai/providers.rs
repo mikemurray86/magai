@@ -14,7 +14,8 @@ use rig::streaming::StreamingChat;
 use rig::tool::server::ToolServerHandle;
 
 use crate::config::{
-    ollama_base_url_from, Config, ProviderConfig, ProviderType, StartupModel, OLLAMA_BASE_URL_ENV,
+    ollama_base_url_from, Config, OpenAIApi, ProviderConfig, ProviderType, StartupModel,
+    OLLAMA_BASE_URL_ENV,
 };
 
 use super::stream::{map_item, OurStream};
@@ -93,24 +94,44 @@ pub(crate) fn build_ollama(
     Ok(dyn_agent_from!(agent))
 }
 
+/// Builds an OpenAI(-compatible) agent over the wire API `api` selects.
+/// rig's two clients have distinct model types, hence the duplicated arms.
 pub(crate) fn build_openai(
     model: &str,
     api_key: &str,
     base_url: Option<&str>,
+    api: OpenAIApi,
     preamble: &str,
     tool_server: Option<ToolServerHandle>,
 ) -> Result<DynAgent, String> {
-    let mut builder = openai::CompletionsClient::builder().api_key(api_key);
-    if let Some(url) = base_url {
-        builder = builder.base_url(url);
+    match api {
+        OpenAIApi::Chat => {
+            let mut builder = openai::CompletionsClient::builder().api_key(api_key);
+            if let Some(url) = base_url {
+                builder = builder.base_url(url);
+            }
+            let client = builder.build().map_err(|e| e.to_string())?;
+            let b = client.agent(model).preamble(preamble);
+            let agent = match tool_server {
+                Some(handle) => b.tool_server_handle(handle).build(),
+                None => b.build(),
+            };
+            Ok(dyn_agent_from!(agent))
+        }
+        OpenAIApi::Responses => {
+            let mut builder = openai::Client::builder().api_key(api_key);
+            if let Some(url) = base_url {
+                builder = builder.base_url(url);
+            }
+            let client = builder.build().map_err(|e| e.to_string())?;
+            let b = client.agent(model).preamble(preamble);
+            let agent = match tool_server {
+                Some(handle) => b.tool_server_handle(handle).build(),
+                None => b.build(),
+            };
+            Ok(dyn_agent_from!(agent))
+        }
     }
-    let client = builder.build().map_err(|e| e.to_string())?;
-    let b = client.agent(model).preamble(preamble);
-    let agent = match tool_server {
-        Some(handle) => b.tool_server_handle(handle).build(),
-        None => b.build(),
-    };
-    Ok(dyn_agent_from!(agent))
 }
 
 pub(crate) fn build_anthropic(
@@ -158,6 +179,7 @@ pub(crate) fn resolve_agent(
                         &nm.model,
                         &key,
                         pc.base_url.as_deref(),
+                        nm.api(pc),
                         &preamble,
                         tool_server,
                     )
@@ -245,6 +267,7 @@ pub(crate) fn build_startup_agent(
                 &startup.model,
                 &key,
                 startup.base_url.as_deref(),
+                startup.api,
                 default_preamble,
                 tool_server,
             )

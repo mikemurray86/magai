@@ -77,8 +77,12 @@ Each LLM provider (Ollama, OpenAI, Anthropic, Groq; Gemini is stubbed/unsupporte
 is wrapped into a type-erased `DynAgent` (a boxed streaming-chat closure, built
 via the shared `dyn_agent_from!` macro so the stream-adaptation logic lives in
 one place) so the rest of the code doesn't care which `rig` client backs the
-current model. `resolve_agent` picks a provider based on the config's named
-models, falling back to treating the alias as a raw Ollama model name.
+current model. `openai`-type providers speak Chat Completions by default;
+`api = "responses"` (on the provider, or overridden per `[[named_models]]`
+entry via `NamedModel::api`) makes `build_openai` use rig's Responses client
+instead, for models that reject `/chat/completions`. `resolve_agent` picks a
+provider based on the config's named models, falling back to treating the
+alias as a raw Ollama model name.
 Streaming responses are normalized into `OurItem`/`OurStream` (`map_item`, in
 `ai/stream.rs`) and then driven by `drive_stream`, which `tokio::select!`s
 between the model stream and incoming `AgentCommand`s (so cancel/approve/deny
