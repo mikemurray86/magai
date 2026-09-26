@@ -1,5 +1,6 @@
 pub const COMMANDS: &[(&str, &str)] = &[
     ("/clear", "clear conversation history"),
+    ("/config", "edit the config file interactively"),
     ("/exit", "quit the application"),
     ("/help", "show available commands"),
     ("/mcp", "list configured MCP servers and their status"),
@@ -15,6 +16,7 @@ pub const COMMANDS: &[(&str, &str)] = &[
         "/restore",
         "reset the whole tree to a checkpoint (/restore <n>)",
     ),
+    ("/theme", "list colour themes, or switch (/theme <name>)"),
     ("/tools", "enable or disable tools (on/off)"),
     ("/undo", "revert the last agent turn's file changes"),
     ("/redo", "re-apply the changes /undo reverted"),
@@ -75,10 +77,14 @@ pub enum SlashCommandAction {
     ShowMessage(String),
     ShowPlugins,
     ShowMcp,
+    /// Suspend the TUI and run the setup wizard.
+    Config,
     RunSkill(String),
     MemorySearch(String),
     MemoryClear,
     Rate(String, String),
+    /// List themes (`None`) or switch to the named one for this session.
+    Theme(Option<String>),
     Unknown(String),
 }
 
@@ -114,6 +120,8 @@ pub fn dispatch(input: &str, skills: &[crate::skills::Skill]) -> SlashCommandAct
         },
         "/plugins" => SlashCommandAction::ShowPlugins,
         "/mcp" => SlashCommandAction::ShowMcp,
+        "/config" => SlashCommandAction::Config,
+        "/theme" => SlashCommandAction::Theme((!arg.is_empty()).then(|| arg.to_string())),
         "/model" => {
             if arg.is_empty() {
                 SlashCommandAction::ShowModel
@@ -151,6 +159,7 @@ pub fn dispatch(input: &str, skills: &[crate::skills::Skill]) -> SlashCommandAct
         "/help" => SlashCommandAction::ShowMessage(
             "/checkpoints       —  list saved checkpoints for this project\n\
              /clear             —  clear conversation\n\
+             /config            —  edit the config file interactively\n\
              /diff [n]          —  show what a turn changed (default: the last)\n\
              /exit, /quit       —  quit the application\n\
              /help              —  show this message\n\
@@ -162,6 +171,7 @@ pub fn dispatch(input: &str, skills: &[crate::skills::Skill]) -> SlashCommandAct
              /rate good|bad|neutral [note] —  rate the last turn for fine-tuning data\n\
              /redo              —  re-apply the changes /undo reverted\n\
              /restore <n>       —  reset the whole tree to checkpoint n\n\
+             /theme [name]      —  list colour themes, or switch to one\n\
              /tools on|off      —  enable or disable tools\n\
              /undo              —  revert the last agent turn's file changes"
                 .to_string(),
@@ -214,6 +224,18 @@ mod tests {
     fn matching_commands_empty_prefix_matches_everything() {
         let results = matching_commands("/", &[skill("foo")]);
         assert_eq!(results.len(), COMMANDS.len() + 1);
+    }
+
+    #[test]
+    fn theme_lists_without_arg_and_switches_with_one() {
+        assert!(matches!(
+            dispatch("/theme", &[]),
+            SlashCommandAction::Theme(None)
+        ));
+        assert!(matches!(
+            dispatch("/theme  classic ", &[]),
+            SlashCommandAction::Theme(Some(ref n)) if n == "classic"
+        ));
     }
 
     #[test]

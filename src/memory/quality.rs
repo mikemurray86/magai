@@ -2,8 +2,6 @@
 //! future fine-tuning export. Reuses the shared `MemoryDb` connection and
 //! `sessions`/`turns`/`tool_calls`/`turn_ratings` tables from `schema.rs`.
 
-use std::sync::Arc;
-
 use rusqlite::params;
 use serde_json::Value;
 use uuid::Uuid;
@@ -141,74 +139,44 @@ fn epoch_secs() -> i64 {
         .as_secs() as i64
 }
 
-/// Fire-and-forget LLM-as-judge rating of a finished turn. Calls the Ollama
-/// generate endpoint at `base_url` with `judge_model`, parses a JSON verdict object out of
-/// the response, and stores it as a `turn_ratings` row with `source =
-/// "judge"`. Runs in a spawned task; all errors are silently swallowed so a
-/// bad model response never interrupts the agent.
-pub async fn judge_turn_async(
-    db: Arc<MemoryDb>,
-    turn_id: String,
-    judge_model: String,
-    user_text: String,
-    assistant_text: String,
-    base_url: String,
-) {
-    let prompt = format!(
-        "Judge the quality of the following AI coding-agent response to a user \
-         request. Consider correctness, relevance, and completeness. \
-         Respond with a single JSON object with exactly three fields: \
-         \"verdict\" (one of \"good\", \"bad\", \"neutral\"), \"score\" (a number \
-         between 0.0 and 1.0), and \"rationale\" (a short one-sentence \
-         explanation). Respond with valid JSON only, no other text.\n\n\
-         User request:\n{user_text}\n\nAssistant response:\n{assistant_text}\n\nJSON:"
-    );
+/// The built-in instructions for the quality judge, used as its system
+/// prompt unless `[quality.judge]` sets `prompt`/`prompt_file`. The turn is
+/// sent as the user message, formatted by [`judge_input`].
+pub const DEFAULT_JUDGE_PROMPT: &str = "Judge the quality of the AI coding-agent response \
+     to a user request that the user sends you. Consider correctness, relevance, and \
+     completeness. Respond with a single JSON object with exactly three fields: \
+     \"verdict\" (one of \"good\", \"bad\", \"neutral\"), \"score\" (a number \
+     between 0.0 and 1.0), and \"rationale\" (a short one-sentence explanation). \
+     Respond with valid JSON only, no other text.";
 
-    let client = reqwest::Client::builder()
-        .connect_timeout(std::time::Duration::from_secs(2))
-        .build()
-        .unwrap_or_default();
-    let Ok(resp) = client
-        .post(format!("{base_url}/api/generate"))
-        .json(&serde_json::json!({
-            "model": judge_model,
-            "prompt": prompt,
-            "stream": false
-        }))
-        .timeout(std::time::Duration::from_secs(30))
-        .send()
-        .await
-    else {
-        return;
-    };
+/// The user message the judge rates.
+pub fn judge_input(user_text: &str, assistant_text: &str) -> String {
+    format!("User request:\n{user_text}\n\nAssistant response:\n{assistant_text}")
+}
 
-    let Ok(body) = resp.json::<Value>().await else {
-        return;
-    };
+/// A judge's reply, parsed: `(verdict, score, rationale)`.
+pub type Verdict = (String, Option<f64>, Option<String>);
 
-    let response_text = match body["response"].as_str() {
-        Some(s) => s.trim().to_owned(),
-        None => return,
-    };
-
-    // Try to parse directly, then fall back to finding the outermost {...}.
-    let parsed: Value = serde_json::from_str(&response_text).unwrap_or_else(|_| {
-        let start = response_text.find('{').unwrap_or(0);
-        let end = response_text.rfind('}').map(|i| i + 1).unwrap_or(0);
+/// Parses the judge's reply. Tolerates prose or code fences around the object
+/// by falling back to the outermost `{...}`; `None` without a non-empty
+/// `verdict`.
+pub fn parse_verdict(response: &str) -> Option<Verdict> {
+    let response = response.trim();
+    let parsed: Value = serde_json::from_str(response).unwrap_or_else(|_| {
+        let start = response.find('{').unwrap_or(0);
+        let end = response.rfind('}').map(|i| i + 1).unwrap_or(0);
         if end > start {
-            serde_json::from_str(&response_text[start..end]).unwrap_or(Value::Null)
+            serde_json::from_str(&response[start..end]).unwrap_or(Value::Null)
         } else {
             Value::Null
         }
     });
-
-    let Some(verdict) = parsed["verdict"].as_str().filter(|s| !s.is_empty()) else {
-        return;
-    };
-    let score = parsed["score"].as_f64();
-    let rationale = parsed["rationale"].as_str();
-
-    record_rating(&db, &turn_id, "judge", Some(verdict), score, rationale);
+    let verdict = parsed["verdict"].as_str().filter(|s| !s.is_empty())?;
+    Some((
+        verdict.to_owned(),
+        parsed["score"].as_f64(),
+        parsed["rationale"].as_str().map(str::to_owned),
+    ))
 }
 
 #[cfg(test)]
@@ -347,5 +315,21 @@ mod tests {
             })
             .expect("count");
         assert_eq!(count, 2);
+    }
+
+    #[test]
+    fn parse_verdict_reads_object_with_or_without_wrapping() {
+        let v = parse_verdict(r#"{"verdict":"good","score":0.9,"rationale":"fine"}"#).unwrap();
+        assert_eq!(v, ("good".to_string(), Some(0.9), Some("fine".to_string())));
+
+        let v = parse_verdict("Here you go: {\"verdict\":\"bad\"} hope that helps").unwrap();
+        assert_eq!(v, ("bad".to_string(), None, None));
+    }
+
+    #[test]
+    fn parse_verdict_rejects_missing_verdict() {
+        assert_eq!(parse_verdict(r#"{"score":0.5}"#), None);
+        assert_eq!(parse_verdict(r#"{"verdict":""}"#), None);
+        assert_eq!(parse_verdict("not json"), None);
     }
 }

@@ -8,15 +8,23 @@ use ratatui::{
     text::{Line, Span},
 };
 
-pub(super) fn markdown_to_static_lines(content: &str, content_w: usize) -> Vec<Line<'static>> {
-    let text = tui_markdown::from_str(content);
+pub(super) fn markdown_to_static_lines(
+    content: &str,
+    content_w: usize,
+    theme: &super::theme::Theme,
+) -> Vec<Line<'static>> {
+    let options = tui_markdown::Options::new(theme.clone());
+    let text = tui_markdown::from_str_with_options(content, &options);
     text.lines
         .into_iter()
         .flat_map(|line| {
+            // tui-markdown puts heading and blockquote styles on the Line, not
+            // its spans; bake it into each span or rebuilding drops it.
+            let line_style = line.style;
             let owned = Line::from(
                 line.spans
                     .into_iter()
-                    .map(|s| Span::styled(s.content.into_owned(), s.style))
+                    .map(|s| Span::styled(s.content.into_owned(), line_style.patch(s.style)))
                     .collect::<Vec<_>>(),
             );
             wrap_styled_line(owned, content_w)
@@ -37,36 +45,64 @@ fn wrap_styled_line(line: Line<'static>, max_width: usize) -> Vec<Line<'static>>
         .flat_map(|s| s.content.chars().map(move |c| (c, s.style)))
         .collect();
 
-    let mut words: Vec<Vec<(char, Style)>> = Vec::new();
+    // Leading indentation is kept verbatim on the first row: it is what
+    // makes code blocks and nested lists readable.
+    let indent: Vec<(char, Style)> = chars
+        .iter()
+        .take_while(|(c, _)| *c == ' ' || *c == '\t')
+        .map(|&(c, style)| (if c == '\t' { ' ' } else { c }, style))
+        .collect();
+
+    // Each word remembers the style of the whitespace before it, so the
+    // joining space keeps e.g. a heading's underline or inline code's
+    // background instead of punching an unstyled hole in it.
+    let mut words: Vec<(Style, Vec<(char, Style)>)> = Vec::new();
     let mut cur_word: Vec<(char, Style)> = Vec::new();
-    for (c, style) in chars {
+    let mut sep_style = Style::default();
+    let mut next_sep = Style::default();
+    for &(c, style) in &chars[indent.len()..] {
         if c.is_whitespace() {
             if !cur_word.is_empty() {
-                words.push(std::mem::take(&mut cur_word));
+                words.push((sep_style, std::mem::take(&mut cur_word)));
             }
+            next_sep = style;
         } else {
+            if cur_word.is_empty() {
+                sep_style = next_sep;
+            }
             cur_word.push((c, style));
         }
     }
     if !cur_word.is_empty() {
-        words.push(cur_word);
+        words.push((sep_style, cur_word));
     }
 
     if words.is_empty() {
         return vec![Line::from(Vec::<Span<'static>>::new())];
     }
+    // An indent that leaves no room for text is dropped rather than overflowing.
+    let indent_w: usize = indent.iter().map(|(c, _)| c.len_utf8()).sum();
+    let indent = if indent_w < max_width {
+        indent
+    } else {
+        Vec::new()
+    };
 
     let byte_width = |w: &[(char, Style)]| -> usize { w.iter().map(|(c, _)| c.len_utf8()).sum() };
 
     let mut result: Vec<Line<'static>> = Vec::new();
-    let mut cur: Vec<(char, Style)> = Vec::new();
-    let mut cur_w = 0usize;
-    for word in words {
+    let mut cur_w: usize = indent.iter().map(|(c, _)| c.len_utf8()).sum();
+    let mut cur: Vec<(char, Style)> = indent;
+    let mut at_line_start = true;
+    for (sep, word) in words {
         let word_w = byte_width(&word);
         if word_w > max_width {
             // Word alone is wider than the available space: hard-break it
-            // so it can never overflow the terminal.
-            if !cur.is_empty() {
+            // so it can never overflow the terminal. A pending indent with no
+            // word on it yet is dropped rather than left on a row of its own.
+            if at_line_start {
+                cur.clear();
+            } else {
                 result.push(chars_to_line(std::mem::take(&mut cur)));
             }
             let mut chunk: Vec<(char, Style)> = Vec::new();
@@ -82,11 +118,11 @@ fn wrap_styled_line(line: Line<'static>, max_width: usize) -> Vec<Line<'static>>
             }
             cur_w = chunk_w;
             cur = chunk;
-        } else if cur.is_empty() {
-            cur_w = word_w;
-            cur = word;
-        } else if cur_w + 1 + word_w <= max_width {
-            cur.push((' ', Style::default()));
+        } else if at_line_start && cur_w + word_w <= max_width {
+            cur_w += word_w;
+            cur.extend(word);
+        } else if !at_line_start && cur_w + 1 + word_w <= max_width {
+            cur.push((' ', sep));
             cur.extend(word);
             cur_w += 1 + word_w;
         } else {
@@ -94,6 +130,7 @@ fn wrap_styled_line(line: Line<'static>, max_width: usize) -> Vec<Line<'static>>
             cur_w = word_w;
             cur = word;
         }
+        at_line_start = false;
     }
     if !cur.is_empty() {
         result.push(chars_to_line(cur));
@@ -215,6 +252,47 @@ pub(super) fn word_wrap(text: &str, max_width: usize) -> Vec<String> {
 mod tests {
     use super::*;
     use ratatui::style::{Color, Modifier};
+
+    #[test]
+    fn styled_wrap_keeps_indent_and_separator_style() {
+        let u = Style::default().add_modifier(Modifier::UNDERLINED);
+        let line = Line::from(vec![Span::raw("    "), Span::styled("let x = 1;", u)]);
+        let out = wrap_styled_line(line, 80);
+        let text: String = out[0].spans.iter().map(|s| s.content.as_ref()).collect();
+        assert_eq!(text, "    let x = 1;");
+        // Same-style chars merge, so the spaces staying inside the underlined
+        // span is exactly what proves they kept its style.
+        assert_eq!(out[0].spans[1], Span::styled("let x = 1;", u));
+    }
+
+    #[test]
+    fn styled_wrap_hard_break_drops_dangling_indent() {
+        let line = Line::from("  abcdefghij");
+        let out = wrap_styled_line(line, 5);
+        for l in &out {
+            let text: String = l.spans.iter().map(|s| s.content.as_ref()).collect();
+            assert!(!text.trim().is_empty(), "blank row in {out:?}");
+            assert!(text.len() <= 5);
+        }
+    }
+
+    #[test]
+    fn markdown_keeps_line_level_styles() {
+        let theme = crate::ui::theme::Theme::default();
+        let lines = markdown_to_static_lines("# Title\n\n> quoted", 80, &theme);
+        let title = &lines[0].spans[0];
+        assert!(title.style.add_modifier.contains(Modifier::BOLD));
+        assert_eq!(title.style.fg, Some(theme.heading1));
+        let quote = lines
+            .iter()
+            .find(|l| l.spans.iter().any(|s| s.content.contains("quoted")))
+            .unwrap();
+        assert!(quote
+            .spans
+            .iter()
+            .filter(|s| s.content.contains("quoted"))
+            .all(|s| s.style.fg == Some(theme.quote)));
+    }
 
     #[test]
     fn word_wrap_breaks_at_width_boundary() {

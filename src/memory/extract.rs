@@ -1,5 +1,3 @@
-use std::sync::Arc;
-
 use rusqlite::Connection;
 use serde_json::Value;
 use uuid::Uuid;
@@ -162,94 +160,130 @@ fn epoch_secs() -> i64 {
         .as_secs() as i64
 }
 
-/// Fire-and-forget LLM-based fact extraction. Calls the Ollama generate
-/// endpoint at `base_url` with `model`, parses the JSON triple array from the response, and
-/// stores each triple as a `Fact` node. Runs in a spawned task; all errors are
-/// silently swallowed so a bad model response never interrupts the agent.
-pub async fn extract_facts_async(
-    db: Arc<MemoryDb>,
-    text: String,
-    model: String,
-    session_alias: String,
-    base_url: String,
-) {
-    let prompt = format!(
-        "Extract factual claims from the text below as a JSON array. \
-         Each element must be an object with exactly three string fields: \
-         \"subject\", \"predicate\", \"object\". \
-         Only extract clear, objective facts — skip opinions, questions, and instructions. \
-         Return [] if nothing is worth storing. \
-         Respond with valid JSON only, no other text.\n\nText:\n{text}\n\nJSON:"
-    );
+/// The built-in instructions for the fact extractor, used as its system
+/// prompt unless `[memory.extractor]` sets `prompt`/`prompt_file`. The text
+/// to classify is sent as the user message.
+pub const DEFAULT_EXTRACTOR_PROMPT: &str = "Extract factual claims from the text the user sends \
+     as a JSON array. Each element must be an object with exactly three string fields: \
+     \"subject\", \"predicate\", \"object\". \
+     Only extract clear, objective facts — skip opinions, questions, and instructions. \
+     Return [] if nothing is worth storing. \
+     Respond with valid JSON only, no other text.";
 
-    let client = reqwest::Client::builder()
-        .connect_timeout(std::time::Duration::from_secs(2))
-        .build()
-        .unwrap_or_default();
-    let Ok(resp) = client
-        .post(format!("{base_url}/api/generate"))
-        .json(&serde_json::json!({
-            "model": model,
-            "prompt": prompt,
-            "stream": false
-        }))
-        .timeout(std::time::Duration::from_secs(30))
-        .send()
-        .await
-    else {
-        return;
-    };
+/// A `(subject, predicate, object)` fact pulled out of a model reply.
+pub type Triple = (String, String, String);
 
-    let Ok(body) = resp.json::<Value>().await else {
-        return;
-    };
-
-    let response_text = match body["response"].as_str() {
-        Some(s) => s.trim().to_owned(),
-        None => return,
-    };
-
-    // Try to parse directly, then fall back to finding the outermost [...].
-    let triples: Value = serde_json::from_str(&response_text).unwrap_or_else(|_| {
-        let start = response_text.find('[').unwrap_or(0);
-        let end = response_text.rfind(']').map(|i| i + 1).unwrap_or(0);
+/// Parses the extractor's reply into triples. Tolerates prose or code fences
+/// around the array by falling back to the outermost `[...]`, and skips any
+/// element missing a non-empty `subject`, `predicate` or `object`.
+pub fn parse_triples(response: &str) -> Vec<Triple> {
+    let response = response.trim();
+    let parsed: Value = serde_json::from_str(response).unwrap_or_else(|_| {
+        let start = response.find('[').unwrap_or(0);
+        let end = response.rfind(']').map(|i| i + 1).unwrap_or(0);
         if end > start {
-            serde_json::from_str(&response_text[start..end]).unwrap_or(Value::Null)
+            serde_json::from_str(&response[start..end]).unwrap_or(Value::Null)
         } else {
             Value::Null
         }
     });
-
-    let Some(arr) = triples.as_array() else {
-        return;
+    let Some(arr) = parsed.as_array() else {
+        return Vec::new();
     };
+    let field = |t: &Value, k: &str| {
+        t[k].as_str()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_owned)
+    };
+    arr.iter()
+        .filter_map(|t| {
+            Some((
+                field(t, "subject")?,
+                field(t, "predicate")?,
+                field(t, "object")?,
+            ))
+        })
+        .collect()
+}
 
+/// Stores each triple as a `Fact` node, with its subject and object as
+/// `ConceptTag`s joined by a RELATED_TO edge so they surface in FTS search.
+pub fn store_facts(db: &MemoryDb, session_alias: &str, triples: &[Triple]) {
+    if triples.is_empty() {
+        return;
+    }
     db.with(|conn| {
         let now = epoch_secs();
         // Keep session node fresh.
-        upsert_node(conn, NodeKind::Session, &session_alias, now);
+        upsert_node(conn, NodeKind::Session, session_alias, now);
 
-        for triple in arr {
-            let subject = match triple["subject"].as_str().filter(|s| !s.is_empty()) {
-                Some(s) => s,
-                None => continue,
-            };
-            let predicate = match triple["predicate"].as_str().filter(|s| !s.is_empty()) {
-                Some(s) => s,
-                None => continue,
-            };
-            let object = match triple["object"].as_str().filter(|s| !s.is_empty()) {
-                Some(s) => s,
-                None => continue,
-            };
-
-            let fact_name = format!("{subject} {predicate} {object}");
-            upsert_node(conn, NodeKind::Fact, &fact_name, now);
-
-            // Link subject and object as concept tags so they appear in FTS search.
+        for (subject, predicate, object) in triples {
+            upsert_node(
+                conn,
+                NodeKind::Fact,
+                &format!("{subject} {predicate} {object}"),
+                now,
+            );
             let subj_id = upsert_node(conn, NodeKind::ConceptTag, subject, now);
             let obj_id = upsert_node(conn, NodeKind::ConceptTag, object, now);
             related_to(conn, &subj_id, &obj_id, now);
         }
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn triple(s: &str, p: &str, o: &str) -> Triple {
+        (s.to_owned(), p.to_owned(), o.to_owned())
+    }
+
+    #[test]
+    fn parse_triples_reads_a_bare_array() {
+        let got =
+            parse_triples(r#"[{"subject":"magai","predicate":"is written in","object":"Rust"}]"#);
+        assert_eq!(got, vec![triple("magai", "is written in", "Rust")]);
+    }
+
+    #[test]
+    fn parse_triples_digs_the_array_out_of_surrounding_prose() {
+        let got = parse_triples(
+            "Sure! ```json\n[{\"subject\":\"a\",\"predicate\":\"b\",\"object\":\"c\"}]\n```",
+        );
+        assert_eq!(got, vec![triple("a", "b", "c")]);
+    }
+
+    #[test]
+    fn parse_triples_skips_incomplete_elements_and_junk() {
+        let got = parse_triples(
+            r#"[{"subject":"a","predicate":"","object":"c"}, {"subject":"x"}, 7,
+                {"subject":" s ","predicate":"p","object":"o"}]"#,
+        );
+        assert_eq!(got, vec![triple("s", "p", "o")]);
+        assert!(parse_triples("no json here").is_empty());
+        assert!(parse_triples(r#"{"subject":"a"}"#).is_empty());
+    }
+
+    #[test]
+    fn store_facts_writes_fact_and_concept_nodes() {
+        let path = std::env::temp_dir().join(format!("magai-extract-test-{}.db", Uuid::new_v4()));
+        let db = MemoryDb::open(&path).expect("open temp db");
+        store_facts(&db, "local", &[triple("magai", "uses", "ratatui")]);
+
+        let count = |kind: &str| -> i64 {
+            db.with(|conn| {
+                conn.query_row(
+                    "SELECT COUNT(*) FROM nodes WHERE kind = ?1",
+                    rusqlite::params![kind],
+                    |row| row.get(0),
+                )
+            })
+            .unwrap()
+        };
+        assert_eq!(count(&NodeKind::Fact.to_string()), 1);
+        assert_eq!(count(&NodeKind::ConceptTag.to_string()), 2);
+        std::fs::remove_file(&path).ok();
+    }
 }

@@ -6,6 +6,7 @@ use crossterm::event::{poll, read, Event, KeyCode, KeyEventKind, KeyModifiers, M
 use std::time::Duration;
 
 use super::{make_textarea, App, ChatMessage, Role};
+use ratatui_textarea::CursorMove;
 
 fn memory_db_for(config: &crate::config::Config) -> Option<crate::memory::MemoryDb> {
     if !config.memory.enabled {
@@ -125,14 +126,7 @@ impl App {
                 self.push_system(format!("current model: {}", self.current_model));
             }
             SlashCommandAction::RunSkill(content) => {
-                if self
-                    .input_history
-                    .last()
-                    .map(|s| s != input)
-                    .unwrap_or(true)
-                {
-                    self.input_history.push(input.to_string());
-                }
+                self.record_history(input);
                 self.messages.push(ChatMessage {
                     role: Role::User,
                     content: content.clone(),
@@ -155,6 +149,10 @@ impl App {
             SlashCommandAction::ShowPlugins => {
                 self.push_system(crate::plugins::summary(&self.plugins));
             }
+            SlashCommandAction::Config => {
+                // Needs the terminal, which only `App::run` holds.
+                self.run_setup = true;
+            }
             SlashCommandAction::ShowMcp => {
                 // status lives with the agent task, so it answers via AiEvent
                 self.user_tx.send(crate::ai::AgentCommand::ListMcp).ok();
@@ -175,6 +173,36 @@ impl App {
                 let msg = rate_turn(&self.config, &turn_id, &verdict, &note);
                 self.push_system(msg);
             }
+            SlashCommandAction::Theme(None) => {
+                let list: Vec<String> = super::theme::available_themes(&self.config.themes)
+                    .into_iter()
+                    .map(|name| {
+                        let mark = if name == self.theme.name { "*" } else { " " };
+                        format!("{mark} {name}")
+                    })
+                    .collect();
+                self.push_system(format!(
+                    "themes (set `theme = \"<name>\"` in config.toml to keep one):\n{}",
+                    list.join("\n")
+                ));
+            }
+            SlashCommandAction::Theme(Some(name)) => {
+                let known = super::theme::available_themes(&self.config.themes);
+                if !known.contains(&name) {
+                    self.push_system(format!(
+                        "unknown theme {name:?} (available: {})",
+                        known.join(", ")
+                    ));
+                } else {
+                    let (theme, warnings) =
+                        super::theme::Theme::resolve(&name, &self.config.themes);
+                    self.theme = theme;
+                    for w in warnings {
+                        self.push_system(format!("config: {w}"));
+                    }
+                    self.push_system(format!("theme set to {name}"));
+                }
+            }
             SlashCommandAction::ShowMessage(msg) | SlashCommandAction::Unknown(msg) => {
                 self.push_system(msg);
             }
@@ -193,21 +221,63 @@ impl App {
             let next = (i + 1) % cmds.len();
             self.cmd_ac_idx = Some(next);
             let name = cmds[next].0.clone();
-            self.textarea = make_textarea(&name, false);
+            self.textarea = make_textarea(&name);
             return;
         }
         let line = self.textarea.lines().first().cloned().unwrap_or_default();
         let common = crate::slash_commands::common_completion(&line, &self.skills)
             .unwrap_or_else(|| line.clone());
         if common.len() > line.len() {
-            self.textarea = make_textarea(&common, false);
+            self.textarea = make_textarea(&common);
             if cmds.len() == 1 {
                 self.cmd_ac_idx = Some(0);
             }
         } else {
             self.cmd_ac_idx = Some(0);
             let name = cmds[0].0.clone();
-            self.textarea = make_textarea(&name, false);
+            self.textarea = make_textarea(&name);
+        }
+    }
+
+    /// Adds a sent prompt to the persistent history. A save failure is shown
+    /// but doesn't block the message; the entry still recalls this session.
+    fn record_history(&mut self, input: &str) {
+        if let Err(e) = self.input_history.push(input) {
+            self.push_system(e);
+        }
+    }
+
+    /// Replaces the input with the next-older history entry.
+    fn history_prev(&mut self) {
+        if self.input_history.is_empty() {
+            return;
+        }
+        let idx = match self.history_cursor {
+            None => self.input_history.len() - 1,
+            Some(i) => i.saturating_sub(1),
+        };
+        self.history_cursor = Some(idx);
+        let text = self.input_history.get(idx).unwrap_or_default().to_string();
+        self.textarea = make_textarea(&text);
+    }
+
+    /// Replaces the input with the next-newer history entry, or clears it
+    /// when stepping past the newest.
+    fn history_next(&mut self) {
+        let Some(idx) = self.history_cursor else {
+            return;
+        };
+        if idx + 1 < self.input_history.len() {
+            self.history_cursor = Some(idx + 1);
+            let text = self
+                .input_history
+                .get(idx + 1)
+                .unwrap_or_default()
+                .to_string();
+            self.textarea = make_textarea(&text);
+        } else {
+            self.history_cursor = None;
+            self.textarea = make_textarea("");
         }
     }
 
@@ -217,20 +287,13 @@ impl App {
         if input.is_empty() {
             return;
         }
-        self.textarea = make_textarea("", false);
+        self.textarea = make_textarea("");
         self.history_cursor = None;
 
         if input.starts_with('/') {
             self.handle_slash_command(&input);
         } else {
-            if self
-                .input_history
-                .last()
-                .map(|s| s != &input)
-                .unwrap_or(true)
-            {
-                self.input_history.push(input.clone());
-            }
+            self.record_history(&input);
             self.messages.push(ChatMessage {
                 role: Role::User,
                 content: input.clone(),
@@ -393,9 +456,9 @@ impl App {
                                 self.is_waiting = false;
                             } else if self.provider_models.is_some() {
                                 self.provider_models = None;
-                                self.textarea = make_textarea("", false);
+                                self.textarea = make_textarea("");
                             } else {
-                                self.textarea = make_textarea("", false);
+                                self.textarea = make_textarea("");
                                 self.history_cursor = None;
                             }
                         }
@@ -407,7 +470,7 @@ impl App {
                                 if !filtered.is_empty() {
                                     let sel = self.provider_model_sel.min(filtered.len() - 1);
                                     let model_id = filtered[sel].to_string();
-                                    self.textarea = make_textarea(&model_id, false);
+                                    self.textarea = make_textarea(&model_id);
                                 }
                             } else if !self.cmd_ac_candidates().is_empty() {
                                 self.complete_slash_command();
@@ -417,8 +480,7 @@ impl App {
                                     let idx =
                                         self.model_ac_idx.unwrap_or(0).min(candidates.len() - 1);
                                     let alias = candidates[idx].alias.clone();
-                                    self.textarea =
-                                        make_textarea(&format!("/model {alias}"), false);
+                                    self.textarea = make_textarea(&format!("/model {alias}"));
                                     self.model_ac_idx = Some(idx);
                                 } else {
                                     let provider_names = self.provider_ac_candidates();
@@ -428,8 +490,7 @@ impl App {
                                             .unwrap_or(0)
                                             .min(provider_names.len() - 1);
                                         let name = provider_names[idx].clone();
-                                        self.textarea =
-                                            make_textarea(&format!("/provider {name}"), false);
+                                        self.textarea = make_textarea(&format!("/provider {name}"));
                                         self.provider_ac_idx = Some(idx);
                                     }
                                 }
@@ -461,7 +522,7 @@ impl App {
                                         .ok();
                                 }
                                 self.provider_models = None;
-                                self.textarea = make_textarea("", false);
+                                self.textarea = make_textarea("");
                             } else {
                                 let cmds = self.cmd_ac_candidates();
                                 if !cmds.is_empty() {
@@ -469,11 +530,11 @@ impl App {
                                         self.textarea.lines().first().cloned().unwrap_or_default();
                                     if let Some(idx) = self.cmd_ac_idx {
                                         let name = cmds[idx.min(cmds.len() - 1)].0.clone();
-                                        self.textarea = make_textarea(&name, false);
+                                        self.textarea = make_textarea(&name);
                                     } else if cmds.len() == 1 && cmds[0].0 != line {
                                         // unambiguous: `/q` submits as `/quit`
                                         let name = cmds[0].0.clone();
-                                        self.textarea = make_textarea(&name, false);
+                                        self.textarea = make_textarea(&name);
                                     }
                                 }
                                 let candidates = self.model_ac_candidates();
@@ -481,8 +542,7 @@ impl App {
                                     if let Some(idx) = self.model_ac_idx {
                                         let alias =
                                             candidates[idx.min(candidates.len() - 1)].alias.clone();
-                                        self.textarea =
-                                            make_textarea(&format!("/model {alias}"), false);
+                                        self.textarea = make_textarea(&format!("/model {alias}"));
                                     }
                                 } else {
                                     let provider_names = self.provider_ac_candidates();
@@ -492,7 +552,7 @@ impl App {
                                                 [idx.min(provider_names.len() - 1)]
                                             .clone();
                                             self.textarea =
-                                                make_textarea(&format!("/provider {name}"), false);
+                                                make_textarea(&format!("/provider {name}"));
                                         }
                                     }
                                 }
@@ -514,7 +574,13 @@ impl App {
                                         self.provider_model_sel - 1
                                     };
                                 }
-                            } else if self.textarea.lines().len() == 1 {
+                            } else if self.textarea.cursor().0 > 0 {
+                                // Multi-line input: walk up to the top line
+                                // before Up means "older history".
+                                self.textarea.move_cursor(CursorMove::Up);
+                            } else if self.textarea.lines().len() > 1 {
+                                self.history_prev();
+                            } else {
                                 let cmds = self.cmd_ac_candidates();
                                 if !cmds.is_empty() {
                                     let n = cmds.len();
@@ -539,14 +605,8 @@ impl App {
                                             None | Some(0) => n - 1,
                                             Some(i) => i - 1,
                                         });
-                                    } else if !self.input_history.is_empty() {
-                                        let idx = match self.history_cursor {
-                                            None => self.input_history.len() - 1,
-                                            Some(i) => i.saturating_sub(1),
-                                        };
-                                        self.history_cursor = Some(idx);
-                                        let text = self.input_history[idx].clone();
-                                        self.textarea = make_textarea(&text, false);
+                                    } else {
+                                        self.history_prev();
                                     }
                                 }
                             }
@@ -557,7 +617,11 @@ impl App {
                                 if n > 0 {
                                     self.provider_model_sel = (self.provider_model_sel + 1) % n;
                                 }
-                            } else if self.textarea.lines().len() == 1 {
+                            } else if self.textarea.cursor().0 + 1 < self.textarea.lines().len() {
+                                self.textarea.move_cursor(CursorMove::Down);
+                            } else if self.textarea.lines().len() > 1 {
+                                self.history_next();
+                            } else {
                                 let cmds = self.cmd_ac_candidates();
                                 if !cmds.is_empty() {
                                     let n = cmds.len();
@@ -582,16 +646,8 @@ impl App {
                                             None => 0,
                                             Some(i) => (i + 1) % n,
                                         });
-                                    } else if let Some(idx) = self.history_cursor {
-                                        if idx + 1 < self.input_history.len() {
-                                            let next = idx + 1;
-                                            self.history_cursor = Some(next);
-                                            let text = self.input_history[next].clone();
-                                            self.textarea = make_textarea(&text, false);
-                                        } else {
-                                            self.history_cursor = None;
-                                            self.textarea = make_textarea("", false);
-                                        }
+                                    } else {
+                                        self.history_next();
                                     }
                                 }
                             }

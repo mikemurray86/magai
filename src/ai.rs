@@ -3,6 +3,7 @@
 //! `AgentCommand`/`AiEvent` channels. See `providers` for provider/model
 //! resolution and `stream` for stream normalization and driving.
 
+mod background;
 mod providers;
 mod stream;
 
@@ -14,12 +15,16 @@ use rig::message::Message;
 use rig::tool::server::{ToolServer, ToolServerHandle};
 use tokio::sync::mpsc;
 
-use crate::approval::{ApprovalGate, GateContext, ToolOutcomeCounter};
+use crate::approval::{
+    ApprovalGate, Danger, GateContext, PermissionMode, SmartReview, ToolOutcomeCounter,
+};
 use crate::checkpoint::{CheckpointStore, SnapshotMeta};
 use crate::config::{Config, ProviderType, StartupChoice};
 use crate::hooks::{HookEvent, HookRunner};
 use crate::memory::{default_db_path, MemoryDb, ToolCallRecord};
 use crate::ui::AiEvent;
+
+use background::Helpers;
 
 use providers::{
     api_key_from_env, build_startup_agent, fetch_models, fetch_models_for, fetch_ollama_models,
@@ -235,7 +240,7 @@ pub(crate) fn build_preamble_from(base: &str, project_ctx: &str) -> String {
 
 // ── tool server ───────────────────────────────────────────────────────────────
 
-async fn build_tool_server(ctx: &GateContext) -> ToolServerHandle {
+async fn build_tool_server(ctx: &GateContext, safe_commands: Vec<Vec<String>>) -> ToolServerHandle {
     let handle = ToolServer::new().run();
 
     macro_rules! add {
@@ -254,7 +259,12 @@ async fn build_tool_server(ctx: &GateContext) -> ToolServerHandle {
     add!(crate::tools::GitStatus, false);
     add!(crate::tools::GitDiff, false);
     add!(crate::tools::WebFetch, false);
-    add!(crate::tools::ShellCmd, true);
+    add!(
+        crate::tools::ShellCmd,
+        Danger::Classify(Arc::new(move |args: &str| {
+            crate::tools::shell_command::is_dangerous(args, &safe_commands)
+        }))
+    );
 
     handle
 }
@@ -449,6 +459,7 @@ fn finish_turn(
     turn_started_at: i64,
     pending_resume: &mut Option<Message>,
     memory_db: &Option<Arc<MemoryDb>>,
+    helpers: &Helpers,
     config: &Config,
     current_model: &str,
     ai_tx: &mpsc::UnboundedSender<AiEvent>,
@@ -464,16 +475,19 @@ fn finish_turn(
     if let Some(db) = memory_db {
         crate::memory::extract::process_turn(db, current_model, tool_records);
 
-        // LLM-based fact extraction — fire-and-forget, opt-in via config.
-        if let Some(model) = config.memory.extract_facts_model.clone() {
+        // LLM-based fact extraction — fire-and-forget, opt-in via
+        // `[memory.extractor]`.
+        if let Some(extractor) = &helpers.extractor {
             let text = extract_final_assistant_text(history);
             if !text.is_empty() {
-                let db = Arc::clone(db);
+                let (extractor, db) = (Arc::clone(extractor), Arc::clone(db));
                 let alias = current_model.to_string();
-                let base_url = config.ollama_base_url();
-                tokio::spawn(crate::memory::extract::extract_facts_async(
-                    db, text, model, alias, base_url,
-                ));
+                tokio::spawn(async move {
+                    if let Some(reply) = extractor.complete(text).await {
+                        let triples = crate::memory::extract::parse_triples(&reply);
+                        crate::memory::extract::store_facts(&db, &alias, &triples);
+                    }
+                });
             }
         }
 
@@ -510,17 +524,27 @@ fn finish_turn(
                     .ok();
 
                 if outcome == "done" && !assistant_text.is_empty() {
-                    if let Some(judge_model) = config.quality.judge_model.clone() {
-                        let db = Arc::clone(db);
-                        let base_url = config.ollama_base_url();
-                        tokio::spawn(crate::memory::quality::judge_turn_async(
-                            db,
-                            turn_id,
-                            judge_model,
-                            user_text,
-                            assistant_text,
-                            base_url,
-                        ));
+                    if let Some(judge) = &helpers.judge {
+                        let (judge, db) = (Arc::clone(judge), Arc::clone(db));
+                        let input =
+                            crate::memory::quality::judge_input(&user_text, &assistant_text);
+                        tokio::spawn(async move {
+                            let Some(reply) = judge.complete(input).await else {
+                                return;
+                            };
+                            if let Some((verdict, score, rationale)) =
+                                crate::memory::quality::parse_verdict(&reply)
+                            {
+                                crate::memory::quality::record_rating(
+                                    &db,
+                                    &turn_id,
+                                    "judge",
+                                    Some(&verdict),
+                                    score,
+                                    rationale.as_deref(),
+                                );
+                            }
+                        });
                     }
                 }
             }
@@ -564,14 +588,40 @@ pub async fn run_agent(
 
     let gate: ApprovalGate = Arc::new(Mutex::new(HashMap::new()));
     let tool_outcomes: ToolOutcomeCounter = Arc::new(Mutex::new((0, 0, 0)));
+    // Built before any tool is wrapped, so a bad reviewer is reported once at
+    // startup and `smart` degrades to `ask-dangerous` rather than failing open.
+    let smart: Option<Arc<SmartReview>> = if config.permission_mode == PermissionMode::Smart {
+        let reviewer = background::build_reviewer(&config)
+            .and_then(|r| r.ok_or_else(|| "[permissions.reviewer] model is not set".to_string()));
+        match reviewer {
+            Ok(r) => Some(Arc::new(SmartReview::new(r))),
+            Err(e) => {
+                ai_tx
+                    .send(AiEvent::Error(format!(
+                        "permission_mode = \"smart\": {e} — falling back to ask-dangerous"
+                    )))
+                    .ok();
+                None
+            }
+        }
+    } else {
+        None
+    };
     let gate_ctx = GateContext {
-        mode: config.permission_mode,
+        mode: if config.permission_mode == PermissionMode::Smart && smart.is_none() {
+            PermissionMode::AskDangerous
+        } else {
+            config.permission_mode
+        },
         gate: gate.clone(),
         event_tx: ai_tx.clone(),
         hook_runner: hook_runner.clone(),
         tool_outcomes: tool_outcomes.clone(),
+        smart: smart.clone(),
+        safe_tools: Arc::new(config.permissions.safe_tools.iter().cloned().collect()),
     };
-    let tool_handle = build_tool_server(&gate_ctx).await;
+    let tool_handle =
+        build_tool_server(&gate_ctx, config.permissions.safe_command_prefixes()).await;
 
     // ── memory ────────────────────────────────────────────────────────────────
     let memory_db: Option<Arc<MemoryDb>> = if config.memory.enabled {
@@ -607,6 +657,12 @@ pub async fn run_agent(
     } else {
         None
     };
+
+    // Resolved once up front so a misconfigured extractor is reported at
+    // startup rather than failing silently in the background every turn.
+    let helpers = Helpers::from_config(&config, memory_db.is_some(), |e| {
+        ai_tx.send(AiEvent::Error(e)).ok();
+    });
 
     // ── MCP ───────────────────────────────────────────────────────────────────
     // Connected last, so a server's tools can be checked against every
@@ -774,6 +830,9 @@ pub async fn run_agent(
             }
             AgentCommand::Clear => {
                 history.clear();
+                if let Some(smart) = &smart {
+                    smart.clear();
+                }
                 ai_tx.send(AiEvent::HistoryCleared).ok();
                 continue;
             }
@@ -913,6 +972,7 @@ pub async fn run_agent(
                             turn_started_at,
                             &mut pending_resume,
                             &memory_db,
+                            &helpers,
                             &config,
                             &current_model,
                             &ai_tx,
@@ -949,6 +1009,7 @@ pub async fn run_agent(
                             turn_started_at,
                             &mut pending_resume,
                             &memory_db,
+                            &helpers,
                             &config,
                             &current_model,
                             &ai_tx,
@@ -1063,6 +1124,9 @@ pub async fn run_agent(
         // Label this turn's checkpoint with the user's prompt, captured before
         // memory context gets prepended to it.
         last_prompt_label = message.clone();
+        if let Some(smart) = &smart {
+            smart.set_turn_request(&message);
+        }
 
         // A new message while a max-turns prompt is outstanding implicitly
         // declines it: stash the unsent prompt into history rather than
@@ -1125,6 +1189,7 @@ pub async fn run_agent(
             turn_started_at,
             &mut pending_resume,
             &memory_db,
+            &helpers,
             &config,
             &current_model,
             &ai_tx,

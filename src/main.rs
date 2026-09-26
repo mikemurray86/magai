@@ -3,10 +3,12 @@ mod approval;
 mod checkpoint;
 mod cli;
 mod config;
+mod history;
 mod hooks;
 mod mcp;
 mod memory;
 mod plugins;
+mod setup;
 mod skills;
 mod slash_commands;
 mod tools;
@@ -30,6 +32,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         return Ok(());
     }
+
+    // First launch: offer the setup wizard while stdin is still a plain terminal.
+    tokio::task::block_in_place(setup::offer_first_run);
 
     let (user_tx, user_rx) = mpsc::unbounded_channel::<ai::AgentCommand>();
     let (ai_tx, ai_rx) = mpsc::unbounded_channel::<AiEvent>();

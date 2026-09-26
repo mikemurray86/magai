@@ -22,10 +22,18 @@
 default_model = "local"
 
 # Controls when magai asks before executing a tool call.
-#   ask-dangerous  — prompt only for write_file, edit_file, shell_command (default)
+#   ask-dangerous  — prompt only for dangerous calls (default): write_file,
+#                    edit_file, untrusted MCP tools, and shell commands that are
+#                    not on the read-only allowlist (ls, cat, rg, git status/
+#                    log/diff, cargo check/build/test/clippy, …)
+#   smart          — dangerous calls must carry a `justification`, and a
+#                    reviewer model (see [permissions.reviewer]) allows them,
+#                    declines with a suggested alternative, asks you, or blocks
+#                    them. A declined call resubmitted unchanged comes to you.
+#                    Without a usable reviewer this behaves as ask-dangerous.
 #   ask-always     — prompt for every tool call
 #   auto           — never prompt; execute all tools silently
-permission_mode = "ask-dangerous"
+permission_mode = "smart"
 
 # Rough token limit for conversation history (4 chars ≈ 1 token).
 # Older turns are trimmed automatically when this threshold is exceeded.
@@ -34,6 +42,22 @@ max_context_tokens = 80000
 # Max number of turns (model replies + tool round-trips) the agent may take
 # per user message before pausing to ask whether to continue. Default: 25.
 max_turns = 25
+
+# TUI colour theme. Built-ins: "catppuccin-mocha" (default) and "classic"
+# (the original 16-colour palette). Switch for the session with /theme <name>;
+# /theme on its own lists what is available.
+# theme = "catppuccin-mocha"
+
+# Custom themes: start from a built-in `base` and override any colour.
+# Values are "#rrggbb", a colour name ("cyan", "light-blue", "dark-gray"), an
+# ANSI index ("208"), or "none" for the terminal's own default.
+# Keys: background text muted subtle user assistant system tool accent
+#       on_accent success warning danger info diff_add diff_remove diff_hunk
+#       heading1 heading1_bg heading minor_heading code code_bg link quote
+# [themes.mocha-solid]
+# base = "catppuccin-mocha"
+# background = "#1e1e2e"     # paint Mocha base instead of the terminal's own
+# accent = "#f5c2e7"         # pink instead of mauve for selections
 
 
 # ── Providers ─────────────────────────────────────────────────────────────────
@@ -117,6 +141,26 @@ model = "claude-sonnet-4-5"
 # api = "responses"
 
 
+# ── Permissions ──────────────────────────────────────────────────────────────
+
+[permissions]
+# Shell commands that never need approval, as prefixes: the program (by name
+# or exact path) followed by the arguments the call must start with. "make"
+# allows every make target; "make test" allows only `make test …`.
+# safe_commands = ["make test", "npm run lint", "just check"]
+
+# Tool names (built-in or MCP) that never need approval.
+# safe_tools = ["web_fetch"]
+
+# The reviewer behind permission_mode = "smart". Any [[named_models]] alias.
+# A custom prompt must still reply with:
+#   {"decision": "allow"|"suggest"|"ask_user"|"deny", "reason": "…", "suggestion": "…"}
+# A timeout or unparsable reply goes to you rather than failing open.
+[permissions.reviewer]
+# model = "local"
+# prompt_file = "~/.config/magai/reviewer.md"
+# timeout_secs = 30
+
 # ── Checkpoints ──────────────────────────────────────────────────────────────
 #
 # magai snapshots the working tree after every turn so you can undo the agent's
@@ -161,6 +205,46 @@ model = "claude-sonnet-4-5"
 # diff_max_bytes = 20000
 
 
+# ── Memory ───────────────────────────────────────────────────────────────────
+#
+# magai keeps a local knowledge graph (sqlite) of the files, searches and
+# commands each turn touches, and injects the most relevant entries into later
+# prompts. The agent can also read and write it directly with the
+# memory_query / memory_save tools.
+
+# [memory]
+# enabled = true
+# inject_context = true
+# max_context_snippets = 5
+# db_path = "~/.local/share/magai/memory.db"
+
+# The fact extractor is a background classifier that reads each finished
+# turn's final response and stores the objective facts in it as
+# subject/predicate/object triples in the graph. Off unless `model` is set,
+# since it costs one extra model call per turn. Failures (timeouts, bad JSON,
+# an unreachable server) are silently dropped; a model that cannot be resolved
+# at all (unknown alias, missing API key) is reported once at startup.
+
+# [memory.extractor]
+# A [[named_models]] alias — any provider works, so a small fast model is a
+# good fit — or, where Ollama is available, a raw Ollama tag. That entry's
+# `system_prompt` is ignored here; `prompt` below is used instead.
+# model = "local"
+#
+# Replace the built-in extraction instructions (sent as the system prompt;
+# the turn's response is the user message). `prompt` wins over `prompt_file`.
+# Whatever you write, the model must still reply with a JSON array of
+# {"subject": "...", "predicate": "...", "object": "..."} objects.
+# prompt = "Extract only facts about this codebase's architecture as a JSON array of {subject, predicate, object}. Return [] if none."
+# prompt_file = "~/.config/magai/prompts/extractor.md"
+#
+# Seconds to wait for one extraction before abandoning it. Default: 30.
+# timeout_secs = 30
+#
+# (`extract_facts_model = "..."` under [memory] is the older spelling of
+# `model` and is still honoured when [memory.extractor] does not set one.)
+
+
 # ── Quality tracking ─────────────────────────────────────────────────────────
 #
 # Persists a transcript of every session/turn (prompt, final response, tool
@@ -172,12 +256,27 @@ model = "claude-sonnet-4-5"
 # [quality]
 # enabled = true
 #
-# When set, also asks this Ollama model to judge each finished turn
-# ("good"/"bad"/"neutral" + a short rationale), stored alongside any manual
-# /rate rating. Adds a background HTTP call per turn — omit to disable. Uses
-# the endpoint from [providers.ollama].base_url / $OLLAMA_API_BASE_URL, and is
-# a silent no-op if that endpoint is unreachable.
-# judge_model = "granite4:latest"
+# The judge asks a model to rate each finished turn ("good"/"bad"/"neutral",
+# a 0–1 score and a short rationale), stored alongside any manual /rate
+# rating. Off unless `model` is set, since it costs one extra model call per
+# turn. Takes the same keys as [memory.extractor]; failures are silently
+# dropped, and an unresolvable model is reported once at startup.
+
+# [quality.judge]
+# A [[named_models]] alias (any provider) or a raw Ollama tag. A stronger model
+# than the one being judged gives more useful ratings.
+# model = "sonnet"
+#
+# Replace the built-in judging instructions (sent as the system prompt; the
+# turn arrives as "User request: … Assistant response: …"). The reply must
+# still be a JSON object with "verdict" and optionally "score"/"rationale".
+# prompt = "Rate only whether the response's code changes are correct. ..."
+# prompt_file = "~/.config/magai/prompts/judge.md"
+#
+# timeout_secs = 30
+#
+# (`judge_model = "..."` under [quality] is the older spelling of `model` and
+# is still honoured when [quality.judge] does not set one.)
 
 
 # ── MCP servers ───────────────────────────────────────────────────────────────

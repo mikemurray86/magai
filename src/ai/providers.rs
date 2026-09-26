@@ -160,49 +160,59 @@ pub(crate) fn resolve_agent(
     project_ctx: &str,
     tool_server: Option<ToolServerHandle>,
 ) -> Result<(DynAgent, String), String> {
+    let preamble = match config.find_named_model(alias) {
+        Some((nm, _)) => match nm.resolve_system_prompt()? {
+            Some(base) => super::build_preamble_from(&base, project_ctx),
+            None => default_preamble.to_string(),
+        },
+        None => default_preamble.to_string(),
+    };
+    resolve_agent_with_preamble(alias, config, &preamble, tool_server)
+        .map(|a| (a, alias.to_string()))
+}
+
+/// Resolves `alias` exactly as [`resolve_agent`] does, but with `preamble`
+/// used verbatim: a `[[named_models]]` entry's `system_prompt` override is
+/// ignored. For background helpers such as the memory fact extractor, whose
+/// instructions must not be swapped for a chat persona.
+pub(crate) fn resolve_agent_with_preamble(
+    alias: &str,
+    config: &Config,
+    preamble: &str,
+    tool_server: Option<ToolServerHandle>,
+) -> Result<DynAgent, String> {
     match config.find_named_model(alias) {
-        Some((nm, pc)) => {
-            let preamble = match nm.resolve_system_prompt()? {
-                Some(base) => super::build_preamble_from(&base, project_ctx),
-                None => default_preamble.to_string(),
-            };
-            let agent = match pc.provider_type {
-                ProviderType::Ollama => build_ollama(
+        Some((nm, pc)) => match pc.provider_type {
+            ProviderType::Ollama => build_ollama(
+                &nm.model,
+                &ollama_base_url(config, pc.base_url.as_deref()),
+                preamble,
+                tool_server,
+            ),
+            ProviderType::OpenAI | ProviderType::Groq => {
+                let key = api_key_from_env(pc.api_key_env.as_deref())?;
+                build_openai(
                     &nm.model,
-                    &ollama_base_url(config, pc.base_url.as_deref()),
-                    &preamble,
+                    &key,
+                    pc.base_url.as_deref(),
+                    nm.api(pc),
+                    preamble,
                     tool_server,
-                ),
-                ProviderType::OpenAI | ProviderType::Groq => {
-                    let key = api_key_from_env(pc.api_key_env.as_deref())?;
-                    build_openai(
-                        &nm.model,
-                        &key,
-                        pc.base_url.as_deref(),
-                        nm.api(pc),
-                        &preamble,
-                        tool_server,
-                    )
-                }
-                ProviderType::Anthropic => {
-                    let key = api_key_from_env(pc.api_key_env.as_deref())?;
-                    build_anthropic(&nm.model, &key, &preamble, tool_server)
-                }
-                ProviderType::Gemini => Err(gemini_unsupported()),
-            }?;
-            Ok((agent, alias.to_string()))
-        }
+                )
+            }
+            ProviderType::Anthropic => {
+                let key = api_key_from_env(pc.api_key_env.as_deref())?;
+                build_anthropic(&nm.model, &key, preamble, tool_server)
+            }
+            ProviderType::Gemini => Err(gemini_unsupported()),
+        },
         // An alias with no `[[named_models]]` entry used to become an Ollama
         // tag unconditionally, which silently turned a typo — or a hosted
         // model id — into a broken local agent. Only do it where Ollama is
         // genuinely the implicit provider.
-        None if config.ollama_is_available() => build_ollama(
-            alias,
-            &ollama_base_url(config, None),
-            default_preamble,
-            tool_server,
-        )
-        .map(|a| (a, alias.to_string())),
+        None if config.ollama_is_available() => {
+            build_ollama(alias, &ollama_base_url(config, None), preamble, tool_server)
+        }
         None => Err(unknown_alias_message(alias, config)),
     }
 }

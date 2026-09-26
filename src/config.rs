@@ -272,6 +272,8 @@ pub struct Config {
     pub mcp_servers: Vec<McpServerConfig>,
     #[serde(default)]
     pub permission_mode: crate::approval::PermissionMode,
+    #[serde(default)]
+    pub permissions: PermissionsConfig,
     #[serde(default = "default_max_context_tokens")]
     pub max_context_tokens: usize,
     #[serde(default = "default_max_turns")]
@@ -284,6 +286,14 @@ pub struct Config {
     pub checkpoints: CheckpointsConfig,
     #[serde(default)]
     pub quality: QualityConfig,
+    /// TUI colour theme: a built-in (`catppuccin-mocha`, `classic`) or a
+    /// `[themes.<name>]` table. Unset means `ui::theme::DEFAULT_THEME`.
+    pub theme: Option<String>,
+    /// User-defined themes: `base = "<built-in>"` plus colour overrides keyed
+    /// by `ui::theme::Theme` field name. Validated by `Theme::resolve`, not
+    /// serde, so a typo warns instead of discarding the whole config.
+    #[serde(default)]
+    pub themes: HashMap<String, HashMap<String, String>>,
 }
 
 fn default_max_context_tokens() -> usize {
@@ -315,10 +325,21 @@ pub struct MemoryConfig {
     #[serde(default = "default_memory_snippets")]
     pub max_context_snippets: usize,
     pub db_path: Option<String>,
-    /// When set, enables LLM-based fact extraction after each turn using this
-    /// Ollama model name (e.g. "granite4:latest"). Disabled by default because
-    /// it adds a background HTTP call per turn.
+    /// The background fact extractor (`[memory.extractor]`): reads each
+    /// turn's final response and stores the facts in it in the graph.
+    #[serde(default)]
+    pub extractor: BackgroundModelConfig,
+    /// Deprecated spelling of `[memory.extractor].model`, still honoured when
+    /// that is unset so existing configs keep working.
     pub extract_facts_model: Option<String>,
+}
+
+impl MemoryConfig {
+    /// The model the fact extractor should run on, if it is enabled at all:
+    /// `[memory.extractor].model`, else the legacy `extract_facts_model`.
+    pub fn extractor_model(&self) -> Option<&str> {
+        self.extractor.model_or(self.extract_facts_model.as_deref())
+    }
 }
 
 impl Default for MemoryConfig {
@@ -328,8 +349,91 @@ impl Default for MemoryConfig {
             inject_context: true,
             max_context_snippets: default_memory_snippets(),
             db_path: None,
+            extractor: BackgroundModelConfig::default(),
             extract_facts_model: None,
         }
+    }
+}
+
+/// `[permissions]`: user-defined exceptions to the approval gate, and the
+/// reviewer model behind `permission_mode = "smart"`.
+#[derive(Debug, Deserialize, Clone, Default)]
+pub struct PermissionsConfig {
+    /// Shell command prefixes that never need approval, e.g. `"make test"`
+    /// or `"npm run lint"`: the program (by name or exact path) followed by
+    /// the leading arguments the call must start with.
+    #[serde(default)]
+    pub safe_commands: Vec<String>,
+    /// Tool names (built-in or MCP) that never need approval.
+    #[serde(default)]
+    pub safe_tools: Vec<String>,
+    /// The model that judges dangerous calls in `smart` mode.
+    #[serde(default)]
+    pub reviewer: BackgroundModelConfig,
+}
+
+impl PermissionsConfig {
+    /// `safe_commands` split into tokens for `shell_command::is_dangerous`;
+    /// blank entries are dropped rather than matching everything.
+    pub fn safe_command_prefixes(&self) -> Vec<Vec<String>> {
+        self.safe_commands
+            .iter()
+            .map(|c| c.split_whitespace().map(str::to_owned).collect::<Vec<_>>())
+            .filter(|t| !t.is_empty())
+            .collect()
+    }
+}
+
+/// A helper model magai runs in the background after a turn — the memory fact
+/// extractor (`[memory.extractor]`) and the quality judge (`[quality.judge]`).
+/// Disabled unless `model` is set, since each adds a model call per turn.
+#[derive(Debug, Deserialize, Clone, Default)]
+pub struct BackgroundModelConfig {
+    /// A `[[named_models]]` alias (any provider), or — where Ollama is
+    /// available — a raw Ollama tag such as `"granite4:latest"`.
+    pub model: Option<String>,
+    /// Inline instructions replacing the built-in prompt. Takes precedence
+    /// over `prompt_file` if both are set. The reply must still be in the JSON
+    /// shape the helper expects.
+    pub prompt: Option<String>,
+    /// Path (relative to the working directory, or absolute) to a file whose
+    /// contents replace the built-in prompt.
+    pub prompt_file: Option<String>,
+    /// How long one call may take before it is abandoned. Defaults to
+    /// [`BackgroundModelConfig::DEFAULT_TIMEOUT_SECS`].
+    pub timeout_secs: Option<u64>,
+}
+
+impl BackgroundModelConfig {
+    pub const DEFAULT_TIMEOUT_SECS: u64 = 30;
+
+    pub fn timeout(&self) -> std::time::Duration {
+        std::time::Duration::from_secs(self.timeout_secs.unwrap_or(Self::DEFAULT_TIMEOUT_SECS))
+    }
+
+    /// `model`, else `legacy` (an older flat key such as
+    /// `extract_facts_model`), ignoring blanks.
+    pub fn model_or<'a>(&'a self, legacy: Option<&'a str>) -> Option<&'a str> {
+        self.model
+            .as_deref()
+            .or(legacy)
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+    }
+
+    /// Reads the custom prompt, if configured. `prompt` wins over
+    /// `prompt_file`; returns `Ok(None)` when neither is set.
+    pub fn resolve_prompt(&self) -> Result<Option<String>, String> {
+        if let Some(s) = &self.prompt {
+            return Ok(Some(s.clone()));
+        }
+        if let Some(path) = &self.prompt_file {
+            let path = expand_tilde(path);
+            return std::fs::read_to_string(&path)
+                .map(Some)
+                .map_err(|e| format!("prompt_file {path:?}: {e}"));
+        }
+        Ok(None)
     }
 }
 
@@ -340,10 +444,20 @@ impl Default for MemoryConfig {
 pub struct QualityConfig {
     #[serde(default)]
     pub enabled: bool,
-    /// When set, enables LLM-as-judge rating of each finished turn using
-    /// this Ollama model name (e.g. "granite4:latest"). Disabled by default
-    /// because it adds a background HTTP call per turn.
+    /// LLM-as-judge rating of each finished turn (`[quality.judge]`).
+    #[serde(default)]
+    pub judge: BackgroundModelConfig,
+    /// Deprecated spelling of `[quality.judge].model`, still honoured when
+    /// that is unset so existing configs keep working.
     pub judge_model: Option<String>,
+}
+
+impl QualityConfig {
+    /// The model the judge should run on, if it is enabled at all:
+    /// `[quality.judge].model`, else the legacy `judge_model`.
+    pub fn judge_model(&self) -> Option<&str> {
+        self.judge.model_or(self.judge_model.as_deref())
+    }
 }
 
 /// Per-turn snapshots of the working tree, kept in a shadow git repository
@@ -1220,6 +1334,33 @@ mod tests {
     }
 
     #[test]
+    fn parses_permissions_table() {
+        let cfg: Config = toml::from_str(
+            r#"
+            permission_mode = "smart"
+
+            [permissions]
+            safe_commands = ["make test", "  ", "npm run lint"]
+            safe_tools = ["web_fetch"]
+
+            [permissions.reviewer]
+            model = "local"
+            "#,
+        )
+        .expect("permissions config parses");
+        assert_eq!(cfg.permission_mode, PermissionMode::Smart);
+        assert_eq!(
+            cfg.permissions.safe_command_prefixes(),
+            vec![
+                vec!["make".to_string(), "test".to_string()],
+                vec!["npm".to_string(), "run".to_string(), "lint".to_string()],
+            ]
+        );
+        assert_eq!(cfg.permissions.safe_tools, vec!["web_fetch"]);
+        assert_eq!(cfg.permissions.reviewer.model.as_deref(), Some("local"));
+    }
+
+    #[test]
     fn empty_toml_uses_defaults() {
         let cfg: Config = toml::from_str("").expect("empty config parses");
         assert_eq!(cfg.named_models.len(), 0);
@@ -1228,5 +1369,83 @@ mod tests {
         assert_eq!(cfg.permission_mode, PermissionMode::AskDangerous);
         assert_eq!(cfg.max_context_tokens, 80_000);
         assert_eq!(cfg.max_turns, 25);
+    }
+
+    #[test]
+    fn extractor_is_off_by_default() {
+        let cfg: Config = toml::from_str("").unwrap();
+        assert_eq!(cfg.memory.extractor_model(), None);
+        assert_eq!(
+            cfg.memory.extractor.timeout(),
+            std::time::Duration::from_secs(BackgroundModelConfig::DEFAULT_TIMEOUT_SECS)
+        );
+        assert_eq!(cfg.memory.extractor.resolve_prompt().unwrap(), None);
+    }
+
+    #[test]
+    fn extractor_table_parses_and_wins_over_legacy_key() {
+        let cfg: Config = toml::from_str(
+            r#"
+            [memory]
+            extract_facts_model = "old"
+
+            [memory.extractor]
+            model = "fast"
+            prompt = "just the facts"
+            timeout_secs = 5
+            "#,
+        )
+        .unwrap();
+        assert_eq!(cfg.memory.extractor_model(), Some("fast"));
+        assert_eq!(cfg.memory.extractor.timeout().as_secs(), 5);
+        assert_eq!(
+            cfg.memory.extractor.resolve_prompt().unwrap().as_deref(),
+            Some("just the facts")
+        );
+    }
+
+    #[test]
+    fn legacy_extract_facts_model_still_enables_extractor() {
+        let cfg: Config =
+            toml::from_str("[memory]\nextract_facts_model = \"granite4:latest\"").unwrap();
+        assert_eq!(cfg.memory.extractor_model(), Some("granite4:latest"));
+    }
+
+    #[test]
+    fn extractor_prompt_file_is_read_and_missing_file_errors() {
+        let path =
+            std::env::temp_dir().join(format!("magai-extractor-prompt-{}.md", std::process::id()));
+        std::fs::write(&path, "from a file").unwrap();
+        let ok = BackgroundModelConfig {
+            prompt_file: Some(path.to_string_lossy().into_owned()),
+            ..Default::default()
+        };
+        assert_eq!(ok.resolve_prompt().unwrap().as_deref(), Some("from a file"));
+        std::fs::remove_file(&path).ok();
+        assert!(ok.resolve_prompt().is_err());
+    }
+
+    #[test]
+    fn judge_table_parses_and_wins_over_legacy_key() {
+        let cfg: Config = toml::from_str(
+            r#"
+            [quality]
+            enabled = true
+            judge_model = "old"
+
+            [quality.judge]
+            model = "sonnet"
+            timeout_secs = 60
+            "#,
+        )
+        .unwrap();
+        assert_eq!(cfg.quality.judge_model(), Some("sonnet"));
+        assert_eq!(cfg.quality.judge.timeout().as_secs(), 60);
+
+        let legacy: Config =
+            toml::from_str("[quality]\njudge_model = \"granite4:latest\"").unwrap();
+        assert_eq!(legacy.quality.judge_model(), Some("granite4:latest"));
+        let off: Config = toml::from_str("").unwrap();
+        assert_eq!(off.quality.judge_model(), None);
     }
 }

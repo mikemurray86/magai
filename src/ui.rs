@@ -6,12 +6,10 @@
 mod input;
 mod render;
 pub(crate) mod text;
+pub(crate) mod theme;
 
-use ratatui::{
-    style::{Color, Modifier, Style},
-    DefaultTerminal,
-};
-use ratatui_textarea::TextArea;
+use ratatui::{style::Style, DefaultTerminal};
+use ratatui_textarea::{CursorMove, TextArea};
 use tokio::sync::mpsc;
 
 use text::{format_tool_call, summarize_result};
@@ -45,6 +43,8 @@ pub enum AiEvent {
         name: String,
         args_json: String,
         is_dangerous: bool,
+        /// Why the `smart`-mode reviewer passed this call to the user.
+        review_note: Option<String>,
     },
     ContextTruncated {
         turns_dropped: usize,
@@ -110,6 +110,7 @@ struct PendingApproval {
     name: String,
     args_json: String,
     is_dangerous: bool,
+    review_note: Option<String>,
 }
 
 pub struct App {
@@ -127,7 +128,8 @@ pub struct App {
     current_model: String,
     pending_approval: Option<PendingApproval>,
     pending_model: Option<String>,
-    input_history: Vec<String>,
+    /// Sent prompts, persisted across restarts; see `crate::history`.
+    input_history: crate::history::History,
     history_cursor: Option<usize>,
     skills: Vec<crate::skills::Skill>,
     plugins: Vec<crate::plugins::Plugin>,
@@ -142,6 +144,9 @@ pub struct App {
     pending_max_turns: Option<usize>,
     max_turns_input: String,
     last_turn_id: Option<String>,
+    theme: theme::Theme,
+    /// Set by `/config`; `run` suspends the TUI for the wizard next frame.
+    run_setup: bool,
 }
 
 impl App {
@@ -155,10 +160,16 @@ impl App {
         let plugin_skills = crate::plugins::extract_skills(&plugins);
         let mut skills = crate::skills::discover();
         skills.extend(plugin_skills);
+        let (input_history, history_warning) =
+            crate::history::History::load(crate::history::History::default_path());
+        let (theme, theme_warnings) = theme::Theme::resolve(
+            config.theme.as_deref().unwrap_or(theme::DEFAULT_THEME),
+            &config.themes,
+        );
 
-        Self {
+        let mut app = Self {
             messages: Vec::new(),
-            textarea: make_textarea("", false),
+            textarea: make_textarea(""),
             exit: false,
             is_waiting: false,
             user_tx,
@@ -171,7 +182,7 @@ impl App {
             current_model,
             pending_approval: None,
             pending_model: None,
-            input_history: Vec::new(),
+            input_history,
             history_cursor: None,
             skills,
             plugins,
@@ -186,7 +197,16 @@ impl App {
             pending_max_turns: None,
             max_turns_input: String::new(),
             last_turn_id: None,
+            theme,
+            run_setup: false,
+        };
+        for w in theme_warnings {
+            app.push_system(format!("config: {w}"));
         }
+        if let Some(w) = history_warning {
+            app.push_system(w);
+        }
+        app
     }
 
     pub fn run(mut self, terminal: &mut DefaultTerminal) -> std::io::Result<()> {
@@ -194,6 +214,44 @@ impl App {
             self.poll_ai_events();
             terminal.draw(|frame| self.draw(frame))?;
             self.handle_events()?;
+            if std::mem::take(&mut self.run_setup) {
+                self.run_setup_wizard(terminal)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// `/config`: leave the alternate screen, run the same wizard as
+    /// `magai init`, then come back. Only the theme applies live — everything
+    /// else is read by the agent task at startup.
+    fn run_setup_wizard(&mut self, terminal: &mut DefaultTerminal) -> std::io::Result<()> {
+        use crossterm::event::{DisableMouseCapture, EnableMouseCapture};
+        use crossterm::terminal::{enable_raw_mode, EnterAlternateScreen};
+
+        crossterm::execute!(std::io::stdout(), DisableMouseCapture)?;
+        ratatui::restore();
+        let outcome = crate::setup::run_interactive();
+        enable_raw_mode()?;
+        crossterm::execute!(std::io::stdout(), EnterAlternateScreen, EnableMouseCapture)?;
+        terminal.clear()?;
+
+        match outcome {
+            Ok(Some(msg)) => {
+                let (config, warning) = crate::config::Config::load();
+                if let Some(w) = warning {
+                    self.push_system(format!("config: {w}"));
+                }
+                let (theme, _) = theme::Theme::resolve(
+                    config.theme.as_deref().unwrap_or(theme::DEFAULT_THEME),
+                    &config.themes,
+                );
+                self.theme = theme;
+                self.push_system(format!(
+                    "{msg} Restart magai to apply model, provider and permission changes."
+                ));
+            }
+            Ok(None) => self.push_system("config unchanged".to_string()),
+            Err(e) => self.push_system(format!("config: {e}")),
         }
         Ok(())
     }
@@ -279,12 +337,14 @@ impl App {
                     name,
                     args_json,
                     is_dangerous,
+                    review_note,
                 } => {
                     self.pending_approval = Some(PendingApproval {
                         call_id,
                         name,
                         args_json,
                         is_dangerous,
+                        review_note,
                     });
                     self.auto_scroll = true;
                 }
@@ -312,7 +372,7 @@ impl App {
                     self.push_system(format!("{count} models from {provider} — ↑↓ navigate  Tab fill  Enter use  Esc dismiss"));
                     self.provider_models = Some((provider, models));
                     self.provider_model_sel = 0;
-                    self.textarea = make_textarea("", false);
+                    self.textarea = make_textarea("");
                     self.model_ac_idx = None;
                 }
                 AiEvent::McpStatus(report) => {
@@ -434,25 +494,20 @@ impl App {
     }
 }
 
-fn make_textarea(text: &str, waiting: bool) -> TextArea<'static> {
+fn make_textarea(text: &str) -> TextArea<'static> {
     let mut ta = if text.is_empty() {
         TextArea::default()
     } else {
-        TextArea::new(vec![text.to_string()])
+        TextArea::new(text.split('\n').map(str::to_string).collect())
     };
+    // TextArea::new leaves the cursor at (0,0); callers are filling in a
+    // completion or recalled entry, so continue typing from the very end —
+    // for a multi-line entry that's the bottom line, so Up walks through it.
+    ta.move_cursor(CursorMove::Bottom);
+    ta.move_cursor(CursorMove::End);
+    // Text and placeholder colours come from the theme, applied each frame
+    // in `draw`.
     ta.set_cursor_line_style(Style::default());
-    ta.set_placeholder_text("  ❯  message…  Shift+Enter for newline");
-    ta.set_placeholder_style(
-        Style::default()
-            .fg(Color::DarkGray)
-            .add_modifier(Modifier::DIM),
-    );
-    if waiting {
-        ta.set_style(
-            Style::default()
-                .fg(Color::DarkGray)
-                .add_modifier(Modifier::DIM),
-        );
-    }
+    ta.set_placeholder_text("message…  Shift+Enter for newline");
     ta
 }

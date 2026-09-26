@@ -30,6 +30,7 @@ rusqlite = { version = "0.32", features = ["bundled"] }
 tui-markdown = "0.3.7"
 ratatui-textarea = "0.9.1"
 toml_edit = "0.22"
+inquire = "0.9"
 
 [dev-dependencies]
 tokio = { version = "1.49.0", features = ["full", "test-util"] }

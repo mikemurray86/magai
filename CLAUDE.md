@@ -19,6 +19,17 @@ comments and formatting survive; `add_server`/`remove_server` operate on a
 `DocumentMut` and are unit-tested without touching the filesystem. Subcommands
 return `Result<(), String>` and `main` prints the message to stderr and exits 1.
 
+`magai init` (and `/config` in the TUI, which suspends the alternate screen to
+run it) is the interactive config wizard in `setup.rs`, built on `inquire`.
+Each question shows the file's current value as the placeholder (Enter keeps
+it) and the serde default in the help line (`-` resets by removing the key);
+defaults come from `toml::from_str::<Config>("")`, not `Config::default()`,
+which is derived and zeroes numeric fields. Keys left at their default are not
+written, and the result is validated against `Config` before saving. Questions
+go through the `Prompter` trait so tests script answers. A bare `magai` with no
+config file offers to run it first (`setup::offer_first_run`). When adding a
+config setting users are likely to change, add a question for it there.
+
 ## Common commands
 
 ```sh
@@ -57,8 +68,8 @@ conventions beyond what's in the source.
 `main.rs` spawns two long-lived tasks that never call each other directly —
 they communicate purely through `tokio::mpsc` channels:
 
-- **`ai::run_agent`** (`src/ai/mod.rs`, plus `ai/providers.rs` and
-  `ai/stream.rs`) — owns the LLM agent, conversation history, tool server, and
+- **`ai::run_agent`** (`src/ai.rs`, plus `ai/providers.rs`, `ai/stream.rs`,
+  and `ai/background.rs`) — owns the LLM agent, conversation history, tool server, and
   hook runner. Receives `AgentCommand`s (user message, model switch,
   approve/deny tool call, clear, undo, …) and emits `AiEvent`s (token,
   tool-call start/result, errors, …).
@@ -100,11 +111,26 @@ a `GatedTool` (approval.rs), which:
    `oneshot` channel registered in the `ApprovalGate` map).
 2. Fires `pre_tool_call` / `post_tool_call` hooks around the actual call.
 
-`write_file`, `edit_file`, and `shell_command` are marked dangerous; everything
-else (reads, search, git status/diff, web fetch) is not. New tools should be
-registered in `build_tool_server` (`ai/mod.rs`) with an explicit danger flag.
-The five values a `GatedTool` needs (mode, gate map, event sender, hook runner,
-outcome counter) are bundled as `approval::GateContext`; `ctx.wrap(tool,
+Danger is an `approval::Danger` (`Safe`, `Always`, or `Classify(closure over the args JSON)`
+decided per call); `bool` converts into it. `write_file` and `edit_file` are
+`Always`; `shell_command` is `Classify(shell_command::is_dangerous)`, a
+fail-closed read-only allowlist (`ls`, `rg`, `git status/log/diff`, `cargo
+check/test/…`) extended by the user's `[permissions] safe_commands` prefixes.
+`[permissions] safe_tools` forces named tools (MCP included) to `Safe` in
+`GateContext::wrap`. New tools should be registered in `build_tool_server`
+(`ai.rs`) with an explicit danger.
+
+`permission_mode = "smart"` sends dangerous calls to a reviewer model
+(`[permissions.reviewer]`, a `BackgroundModelConfig` built by
+`background::build_reviewer` before the tool server). The gate injects a
+required `justification` argument into dangerous tools' schemas and strips it
+before the real call; the reviewer's verdict (`approval::review::parse_review`)
+allows, declines with a suggestion, asks the user (approval card shows
+`review_note`), or blocks. A declined call resubmitted with identical args goes
+to the user (`SmartReview::denied`, cleared on `/clear`). No reviewer, or no
+usable verdict, falls back to asking the user — never to allowing.
+The values a `GatedTool` needs (mode, gate map, event sender, hook runner,
+outcome counter, smart reviewer, safe tools) are bundled as `approval::GateContext`; `ctx.wrap(tool,
 dangerous)` is how both built-in and MCP tools get gated.
 `grep_search` and `find_files` share their glob-pattern matching via
 `tools::glob` (`glob_to_regex`/`glob_match`) rather than duplicating it.
@@ -137,6 +163,21 @@ dangerous)` is how both built-in and MCP tools get gated.
   would scribble over the TUI) and its tail is appended to connection errors,
   and each connection is bounded by the server's `timeout_secs`.
 
+- **Background helper models** (`ai/background.rs`) — the memory fact
+  extractor (`[memory.extractor]`) and the quality judge (`[quality.judge]`)
+  share `config::BackgroundModelConfig` (`model`, `prompt`/`prompt_file`,
+  `timeout_secs`) and run as a `BackgroundModel` after each turn. Their
+  prompts and reply parsing are pure functions next to what they store
+  (`memory::extract::{DEFAULT_EXTRACTOR_PROMPT, parse_triples, store_facts}`,
+  `memory::quality::{DEFAULT_JUDGE_PROMPT, judge_input, parse_verdict}`).
+  Models resolve via `providers::resolve_agent_with_preamble`, so any
+  `[[named_models]]` alias works, and that entry's `system_prompt` is
+  deliberately ignored in favour of the helper's prompt. Both are built once
+  in `run_agent` (`background::Helpers`), so a bad model is reported at
+  startup rather than failing silently each turn. Never add a helper that
+  talks to a provider directly or hardcodes a model — give it a
+  `BackgroundModelConfig` instead.
+
 Plugin-provided hooks/skills/MCP configs are merged with config-level ones in
 `run_agent` — when touching one of these systems, check whether the plugin path
 also needs updating.
@@ -167,6 +208,23 @@ slash-command dispatch, autocomplete, the approval-card key intercept, message
 submission) live in `ui/input.rs`. `view_width`/`view_height` are recomputed
 from the actual `history_area` each frame and drive both wrapping and
 scroll-offset math — don't hardcode terminal dimensions.
+
+Colours come from `App::theme` (`ui/theme.rs`), never `Color::*` literals in
+render code. `Theme` is a flat set of semantic slots (`user`, `accent`,
+`danger`, `diff_add`, …) and also implements `tui_markdown::StyleSheet`, so
+assistant markdown follows it too. Built-ins are `catppuccin-mocha` (default)
+and `classic` (the original palette); config `theme = "<name>"` picks one and
+`[themes.<name>]` tables (`base` + per-slot overrides) are validated by
+`Theme::resolve`, which warns rather than failing. `/theme` switches live.
+A new colour role means a new field on `Theme` — set it in both built-ins and
+add it to `slot_mut` so config can override it. Popups draw over `Clear`, which
+resets the background, so their `Block`s re-apply `theme.base()`.
+
+Up/Down prompt recall reads `App::input_history`, a `history::History` backed
+by one global `$XDG_DATA_HOME/magai/history.jsonl` (not per project or
+session). Entries are appended as JSON strings, one per line, so concurrent
+instances don't clobber each other and multi-line prompts survive; the file is
+compacted to the newest 1000 once it doubles. Record via `App::record_history`.
 
 ### System prompt / project instructions
 

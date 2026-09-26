@@ -4,28 +4,33 @@
 
 use ratatui::{
     layout::{Constraint, Layout, Rect},
-    style::{Color, Modifier, Style},
+    style::{Modifier, Style},
     text::{Line, Span},
     widgets::{Block, Borders, Clear, Paragraph},
     Frame,
 };
 
 use super::text::{markdown_to_static_lines, word_wrap};
+use super::theme::Theme;
 use super::{App, CheckpointPrompt, Role};
 
 impl App {
     pub(super) fn draw(&mut self, frame: &mut Frame) {
         self.spinner_frame = self.spinner_frame.wrapping_add(1);
+        let t = self.theme.clone();
         let area = frame.area();
+        // Paint the theme background first; every widget below only sets a
+        // foreground, so this shows through.
+        frame.render_widget(Block::new().style(t.base()), area);
         let input_h = (self.textarea.lines().len() as u16).clamp(1, 5);
         // Update textarea style to reflect waiting state
         self.textarea.set_style(if self.is_waiting {
-            Style::default()
-                .fg(Color::DarkGray)
-                .add_modifier(Modifier::DIM)
+            Style::default().fg(t.subtle).add_modifier(Modifier::DIM)
         } else {
-            Style::default().fg(Color::White)
+            Style::default().fg(t.text)
         });
+        self.textarea
+            .set_placeholder_style(Style::default().fg(t.subtle).add_modifier(Modifier::DIM));
         let [title_area, sep_top, history_area, sep_bot, input_area, status_area] =
             area.layout(&Layout::vertical([
                 Constraint::Length(1),
@@ -43,9 +48,7 @@ impl App {
         frame.render_widget(
             Paragraph::new(Line::from(Span::styled(
                 "  magai",
-                Style::default()
-                    .fg(Color::White)
-                    .add_modifier(Modifier::BOLD),
+                Style::default().fg(t.text).add_modifier(Modifier::BOLD),
             ))),
             title_area,
         );
@@ -53,7 +56,7 @@ impl App {
         // ── separators ────────────────────────────────────
         let rule = Span::styled(
             "─".repeat(area.width as usize),
-            Style::default().fg(Color::DarkGray),
+            Style::default().fg(t.subtle),
         );
         frame.render_widget(Paragraph::new(Line::from(rule.clone())), sep_top);
         frame.render_widget(Paragraph::new(Line::from(rule)), sep_bot);
@@ -72,13 +75,27 @@ impl App {
         frame.render_widget(Paragraph::new(lines).scroll((self.scroll, 0)), history_area);
 
         // ── input ─────────────────────────────────────────
-        frame.render_widget(&self.textarea, input_area);
+        // The prompt is a fixed gutter rather than part of the placeholder:
+        // the textarea draws its cursor cell before the placeholder text, which
+        // put the cursor in front of the ❯, and the ❯ vanished once typing began.
+        let [prompt_area, text_area] = input_area.layout(&Layout::horizontal([
+            Constraint::Length(4),
+            Constraint::Fill(1),
+        ]));
+        frame.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                "  ❯ ",
+                Style::default().fg(if self.is_waiting { t.subtle } else { t.accent }),
+            ))),
+            prompt_area,
+        );
+        frame.render_widget(&self.textarea, text_area);
 
         // ── model label (under the input) ─────────────────
         frame.render_widget(
             Paragraph::new(Line::from(Span::styled(
                 format!("  [{}]", self.current_model),
-                Style::default().fg(Color::DarkGray),
+                Style::default().fg(t.subtle),
             ))),
             status_area,
         );
@@ -104,18 +121,16 @@ impl App {
                         let is_sel = selected == Some(i);
                         let alias_style = if is_sel {
                             Style::default()
-                                .fg(Color::Black)
-                                .bg(Color::Yellow)
+                                .fg(t.on_accent)
+                                .bg(t.accent)
                                 .add_modifier(Modifier::BOLD)
                         } else {
-                            Style::default()
-                                .fg(Color::Yellow)
-                                .add_modifier(Modifier::BOLD)
+                            Style::default().fg(t.accent).add_modifier(Modifier::BOLD)
                         };
                         let desc_style = if is_sel {
-                            Style::default().fg(Color::Black).bg(Color::Yellow)
+                            Style::default().fg(t.on_accent).bg(t.accent)
                         } else {
-                            Style::default().fg(Color::DarkGray)
+                            Style::default().fg(t.subtle)
                         };
                         let desc = format!("{}/{}", mc.provider, mc.model);
                         Line::from(vec![
@@ -128,8 +143,9 @@ impl App {
                 frame.render_widget(
                     Paragraph::new(popup_lines).block(
                         Block::new()
+                            .style(t.base())
                             .borders(Borders::ALL)
-                            .border_style(Style::default().fg(Color::DarkGray)),
+                            .border_style(Style::default().fg(t.subtle)),
                     ),
                     popup_rect,
                 );
@@ -153,13 +169,11 @@ impl App {
                             let is_sel = selected == Some(i);
                             let style = if is_sel {
                                 Style::default()
-                                    .fg(Color::Black)
-                                    .bg(Color::Yellow)
+                                    .fg(t.on_accent)
+                                    .bg(t.accent)
                                     .add_modifier(Modifier::BOLD)
                             } else {
-                                Style::default()
-                                    .fg(Color::Yellow)
-                                    .add_modifier(Modifier::BOLD)
+                                Style::default().fg(t.accent).add_modifier(Modifier::BOLD)
                             };
                             Line::from(Span::styled(format!(" {name}"), style))
                         })
@@ -168,8 +182,9 @@ impl App {
                     frame.render_widget(
                         Paragraph::new(popup_lines).block(
                             Block::new()
+                                .style(t.base())
                                 .borders(Borders::ALL)
-                                .border_style(Style::default().fg(Color::DarkGray)),
+                                .border_style(Style::default().fg(t.subtle)),
                         ),
                         popup_rect,
                     );
@@ -200,17 +215,15 @@ impl App {
                                 let (name_style, desc_style) = if is_sel {
                                     (
                                         Style::default()
-                                            .fg(Color::Black)
-                                            .bg(Color::Yellow)
+                                            .fg(t.on_accent)
+                                            .bg(t.accent)
                                             .add_modifier(Modifier::BOLD),
-                                        Style::default().fg(Color::Black).bg(Color::Yellow),
+                                        Style::default().fg(t.on_accent).bg(t.accent),
                                     )
                                 } else {
                                     (
-                                        Style::default()
-                                            .fg(Color::Yellow)
-                                            .add_modifier(Modifier::BOLD),
-                                        Style::default().fg(Color::DarkGray),
+                                        Style::default().fg(t.accent).add_modifier(Modifier::BOLD),
+                                        Style::default().fg(t.subtle),
                                     )
                                 };
                                 Line::from(vec![
@@ -223,8 +236,9 @@ impl App {
                         frame.render_widget(
                             Paragraph::new(popup_lines).block(
                                 Block::new()
+                                    .style(t.base())
                                     .borders(Borders::ALL)
-                                    .border_style(Style::default().fg(Color::DarkGray)),
+                                    .border_style(Style::default().fg(t.subtle)),
                             ),
                             popup_rect,
                         );
@@ -258,9 +272,9 @@ impl App {
                     .map(|(i, name)| {
                         let is_sel = start + i == sel;
                         let style = if is_sel {
-                            Style::default().fg(Color::Black).bg(Color::Yellow)
+                            Style::default().fg(t.on_accent).bg(t.accent)
                         } else {
-                            Style::default().fg(Color::White)
+                            Style::default().fg(t.text)
                         };
                         Line::from(Span::styled(format!(" {name}"), style))
                     })
@@ -269,13 +283,12 @@ impl App {
                 frame.render_widget(
                     Paragraph::new(popup_lines).block(
                         Block::new()
+                            .style(t.base())
                             .borders(Borders::ALL)
-                            .border_style(Style::default().fg(Color::Yellow))
+                            .border_style(Style::default().fg(t.accent))
                             .title(Span::styled(
                                 format!(" {} ", alias),
-                                Style::default()
-                                    .fg(Color::Yellow)
-                                    .add_modifier(Modifier::BOLD),
+                                Style::default().fg(t.accent).add_modifier(Modifier::BOLD),
                             )),
                     ),
                     popup_rect,
@@ -285,7 +298,7 @@ impl App {
 
         // ── checkpoint confirmation card ───────────────────
         if let Some(prompt) = &self.pending_checkpoint {
-            render_checkpoint_prompt(frame, area, prompt);
+            render_checkpoint_prompt(frame, area, prompt, &t);
         }
 
         // ── max turns reached prompt card ───────────────────
@@ -303,7 +316,7 @@ impl App {
             let card_lines = vec![
                 Line::from(Span::styled(
                     format!("  Reached {max_turns} turns without finishing."),
-                    Style::default().fg(Color::Yellow),
+                    Style::default().fg(t.warning),
                 )),
                 Line::raw(""),
                 Line::from(vec![
@@ -313,13 +326,10 @@ impl App {
                 ]),
                 Line::raw(""),
                 Line::from(vec![
-                    Span::styled(
-                        " Enter ",
-                        Style::default().fg(Color::Black).bg(Color::Green),
-                    ),
-                    Span::styled(" confirm   ", Style::default().fg(Color::Green)),
-                    Span::styled(" Esc ", Style::default().fg(Color::Black).bg(Color::Yellow)),
-                    Span::styled(" stop   ", Style::default().fg(Color::Yellow)),
+                    Span::styled(" Enter ", Style::default().fg(t.on_accent).bg(t.success)),
+                    Span::styled(" confirm   ", Style::default().fg(t.success)),
+                    Span::styled(" Esc ", Style::default().fg(t.on_accent).bg(t.warning)),
+                    Span::styled(" stop   ", Style::default().fg(t.warning)),
                     Span::raw("type digits to change amount"),
                 ]),
             ];
@@ -327,13 +337,12 @@ impl App {
             frame.render_widget(
                 Paragraph::new(card_lines).block(
                     Block::new()
+                        .style(t.base())
                         .borders(Borders::ALL)
-                        .border_style(Style::default().fg(Color::Yellow))
+                        .border_style(Style::default().fg(t.warning))
                         .title(Span::styled(
                             " max turns reached ",
-                            Style::default()
-                                .fg(Color::Yellow)
-                                .add_modifier(Modifier::BOLD),
+                            Style::default().fg(t.warning).add_modifier(Modifier::BOLD),
                         )),
                 ),
                 card_rect,
@@ -345,16 +354,26 @@ impl App {
             let card_w = (area.width.saturating_sub(8)).min(60);
             let inner_w = card_w.saturating_sub(4) as usize;
             let args_lines = word_wrap(&approval.args_json, inner_w);
-            // content rows: name + args + blank + keys; +2 for border
-            let card_h = (5 + args_lines.len() as u16).min(area.height.saturating_sub(2));
+            let note_lines = approval
+                .review_note
+                .as_deref()
+                .map(|n| word_wrap(n, inner_w))
+                .unwrap_or_default();
+            // content rows: name + args + blank + keys (+ blank + note); +2 for border
+            let note_h = if note_lines.is_empty() {
+                0
+            } else {
+                1 + note_lines.len() as u16
+            };
+            let card_h = (5 + args_lines.len() as u16 + note_h).min(area.height.saturating_sub(2));
             let card_x = (area.width.saturating_sub(card_w)) / 2;
             let card_y = (area.height.saturating_sub(card_h)) / 2;
             let card_rect = Rect::new(card_x, card_y, card_w, card_h);
 
             let color = if approval.is_dangerous {
-                Color::Red
+                t.danger
             } else {
-                Color::Yellow
+                t.warning
             };
 
             let mut card_lines = vec![Line::from(vec![
@@ -367,8 +386,17 @@ impl App {
             for l in &args_lines {
                 card_lines.push(Line::from(Span::styled(
                     format!("  {l}"),
-                    Style::default().fg(Color::Gray),
+                    Style::default().fg(t.muted),
                 )));
+            }
+            if !note_lines.is_empty() {
+                card_lines.push(Line::raw(""));
+                for l in &note_lines {
+                    card_lines.push(Line::from(Span::styled(
+                        format!("  {l}"),
+                        Style::default().fg(t.warning),
+                    )));
+                }
             }
             // separator + keybinding row
             card_lines.push(Line::raw(""));
@@ -377,25 +405,26 @@ impl App {
                 Span::styled(
                     " y ",
                     Style::default()
-                        .fg(Color::Black)
-                        .bg(Color::Green)
+                        .fg(t.on_accent)
+                        .bg(t.success)
                         .add_modifier(Modifier::BOLD),
                 ),
-                Span::styled(" approve    ", Style::default().fg(Color::Green)),
+                Span::styled(" approve    ", Style::default().fg(t.success)),
                 Span::styled(
                     " n ",
                     Style::default()
-                        .fg(Color::Black)
-                        .bg(Color::Red)
+                        .fg(t.on_accent)
+                        .bg(t.danger)
                         .add_modifier(Modifier::BOLD),
                 ),
-                Span::styled(" deny", Style::default().fg(Color::Red)),
+                Span::styled(" deny", Style::default().fg(t.danger)),
             ]));
 
             frame.render_widget(Clear, card_rect);
             frame.render_widget(
                 Paragraph::new(card_lines).block(
                     Block::new()
+                        .style(t.base())
                         .borders(Borders::ALL)
                         .border_style(Style::default().fg(color))
                         .title(Span::styled(
@@ -409,54 +438,45 @@ impl App {
     }
 
     fn build_lines(&self) -> Vec<Line<'static>> {
+        let t = &self.theme;
         let mut lines: Vec<Line<'static>> = Vec::new();
 
         for msg in &self.messages {
             let (label, label_style, text_style): (String, Style, Style) = match msg.role {
                 Role::User => (
                     " you  ".into(),
-                    Style::default()
-                        .fg(Color::Cyan)
-                        .add_modifier(Modifier::BOLD),
-                    Style::default().fg(Color::White),
+                    Style::default().fg(t.user).add_modifier(Modifier::BOLD),
+                    Style::default().fg(t.text),
                 ),
                 Role::Assistant => {
                     let name = msg.model_name.as_deref().unwrap_or("ai");
                     (
                         format!(" {name}  "),
                         Style::default()
-                            .fg(Color::Green)
+                            .fg(t.assistant)
                             .add_modifier(Modifier::BOLD),
-                        Style::default().fg(Color::White),
+                        Style::default().fg(t.text),
                     )
                 }
                 Role::System => (
                     " sys  ".into(),
-                    Style::default()
-                        .fg(Color::Yellow)
-                        .add_modifier(Modifier::DIM),
-                    Style::default()
-                        .fg(Color::Yellow)
-                        .add_modifier(Modifier::DIM),
+                    Style::default().fg(t.system).add_modifier(Modifier::DIM),
+                    Style::default().fg(t.system).add_modifier(Modifier::DIM),
                 ),
                 Role::Diff => (
                     "      ".into(),
-                    Style::default().fg(Color::DarkGray),
-                    Style::default().fg(Color::Gray),
+                    Style::default().fg(t.subtle),
+                    Style::default().fg(t.muted),
                 ),
                 Role::ToolCall => (
                     String::from(" tool "),
-                    Style::default()
-                        .fg(Color::Magenta)
-                        .add_modifier(Modifier::BOLD),
-                    Style::default().fg(Color::DarkGray),
+                    Style::default().fg(t.tool).add_modifier(Modifier::BOLD),
+                    Style::default().fg(t.subtle),
                 ),
                 Role::ToolResult => (
                     "      ".into(),
-                    Style::default().fg(Color::DarkGray),
-                    Style::default()
-                        .fg(Color::DarkGray)
-                        .add_modifier(Modifier::DIM),
+                    Style::default().fg(t.subtle),
+                    Style::default().fg(t.subtle).add_modifier(Modifier::DIM),
                 ),
             };
 
@@ -469,17 +489,15 @@ impl App {
                 // the +/- column has to stay in place to mean anything.
                 for (i, raw) in msg.content.lines().enumerate() {
                     let style = if raw.starts_with("+++") || raw.starts_with("---") {
-                        Style::default()
-                            .fg(Color::DarkGray)
-                            .add_modifier(Modifier::BOLD)
+                        Style::default().fg(t.subtle).add_modifier(Modifier::BOLD)
                     } else if raw.starts_with("diff ") || raw.starts_with("index ") {
-                        Style::default().fg(Color::DarkGray)
+                        Style::default().fg(t.subtle)
                     } else if raw.starts_with("@@") {
-                        Style::default().fg(Color::Cyan)
+                        Style::default().fg(t.diff_hunk)
                     } else if raw.starts_with('+') {
-                        Style::default().fg(Color::Green)
+                        Style::default().fg(t.diff_add)
                     } else if raw.starts_with('-') {
-                        Style::default().fg(Color::Red)
+                        Style::default().fg(t.diff_remove)
                     } else {
                         text_style
                     };
@@ -500,7 +518,7 @@ impl App {
 
             if msg.role == Role::Assistant && !msg.content.is_empty() {
                 // Render with markdown
-                let md_lines = markdown_to_static_lines(&msg.content, content_w);
+                let md_lines = markdown_to_static_lines(&msg.content, content_w, t);
                 for (i, line) in md_lines.into_iter().enumerate() {
                     if i == 0 {
                         let mut spans = vec![Span::styled(label.clone(), label_style)];
@@ -553,9 +571,7 @@ impl App {
             let spinner = SPINNER[(self.spinner_frame as usize / 3) % SPINNER.len()];
             lines.push(Line::from(Span::styled(
                 format!(" {}  {}", self.current_model, spinner),
-                Style::default()
-                    .fg(Color::DarkGray)
-                    .add_modifier(Modifier::ITALIC),
+                Style::default().fg(t.subtle).add_modifier(Modifier::ITALIC),
             )));
         }
 
@@ -565,16 +581,14 @@ impl App {
 
 /// The confirmation card shown before an undo or restore touches any file.
 /// Height follows the content, since the stat block is variable-length.
-fn render_checkpoint_prompt(frame: &mut Frame, area: Rect, prompt: &CheckpointPrompt) {
+fn render_checkpoint_prompt(frame: &mut Frame, area: Rect, prompt: &CheckpointPrompt, t: &Theme) {
     let card_w = (area.width.saturating_sub(8)).min(72);
     let inner_w = card_w.saturating_sub(4) as usize;
 
     let mut card_lines: Vec<Line> = vec![
         Line::from(Span::styled(
             format!("  {}", truncate(&prompt.title, inner_w)),
-            Style::default()
-                .fg(Color::Cyan)
-                .add_modifier(Modifier::BOLD),
+            Style::default().fg(t.info).add_modifier(Modifier::BOLD),
         )),
         Line::raw(""),
     ];
@@ -582,7 +596,7 @@ fn render_checkpoint_prompt(frame: &mut Frame, area: Rect, prompt: &CheckpointPr
     for line in &prompt.lines {
         card_lines.push(Line::from(Span::styled(
             truncate(line, inner_w),
-            Style::default().fg(Color::Gray),
+            Style::default().fg(t.muted),
         )));
     }
     card_lines.push(Line::raw(""));
@@ -593,45 +607,45 @@ fn render_checkpoint_prompt(frame: &mut Frame, area: Rect, prompt: &CheckpointPr
                 2,
                 Line::from(Span::styled(
                     format!("  {}", truncate(reason, inner_w)),
-                    Style::default().fg(Color::Red),
+                    Style::default().fg(t.danger),
                 )),
             );
             card_lines.insert(3, Line::raw(""));
             (
-                Color::Red,
+                t.danger,
                 Line::from(vec![
                     Span::raw("  "),
                     Span::styled(
                         " esc ",
                         Style::default()
-                            .fg(Color::Black)
-                            .bg(Color::Yellow)
+                            .fg(t.on_accent)
+                            .bg(t.warning)
                             .add_modifier(Modifier::BOLD),
                     ),
-                    Span::styled(" dismiss", Style::default().fg(Color::Yellow)),
+                    Span::styled(" dismiss", Style::default().fg(t.warning)),
                 ]),
             )
         }
         None => (
-            Color::Cyan,
+            t.info,
             Line::from(vec![
                 Span::raw("  "),
                 Span::styled(
                     " y ",
                     Style::default()
-                        .fg(Color::Black)
-                        .bg(Color::Green)
+                        .fg(t.on_accent)
+                        .bg(t.success)
                         .add_modifier(Modifier::BOLD),
                 ),
-                Span::styled(" apply    ", Style::default().fg(Color::Green)),
+                Span::styled(" apply    ", Style::default().fg(t.success)),
                 Span::styled(
                     " n ",
                     Style::default()
-                        .fg(Color::Black)
-                        .bg(Color::Yellow)
+                        .fg(t.on_accent)
+                        .bg(t.warning)
                         .add_modifier(Modifier::BOLD),
                 ),
-                Span::styled(" cancel", Style::default().fg(Color::Yellow)),
+                Span::styled(" cancel", Style::default().fg(t.warning)),
             ]),
         ),
     };
@@ -646,6 +660,7 @@ fn render_checkpoint_prompt(frame: &mut Frame, area: Rect, prompt: &CheckpointPr
     frame.render_widget(
         Paragraph::new(card_lines).block(
             Block::new()
+                .style(t.base())
                 .borders(Borders::ALL)
                 .border_style(Style::default().fg(border))
                 .title(Span::styled(

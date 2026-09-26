@@ -363,6 +363,8 @@ pub async fn check(servers: &[McpServerConfig]) -> String {
         event_tx,
         hook_runner: Arc::new(crate::hooks::HookRunner::new(Vec::new())),
         tool_outcomes: Arc::new(Mutex::new((0, 0, 0))),
+        smart: None,
+        safe_tools: Default::default(),
     };
 
     let (services, statuses) = connect_servers(servers, handle, ctx).await;
@@ -469,6 +471,8 @@ mod tests {
                 event_tx,
                 hook_runner: Arc::new(HookRunner::new(Vec::new())),
                 tool_outcomes: outcomes,
+                smart: None,
+                safe_tools: Default::default(),
             },
             event_rx,
             gate,

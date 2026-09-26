@@ -20,6 +20,8 @@ pub struct Cli {
 
 #[derive(Subcommand)]
 pub enum Command {
+    /// Create or edit the config interactively
+    Init,
     /// Manage MCP servers
     #[command(subcommand)]
     Mcp(McpCommand),
@@ -365,6 +367,12 @@ fn remove(name: &str) -> Result<(), String> {
 /// Run a subcommand. Returns an error message suitable for stderr.
 pub async fn run(command: Command) -> Result<(), String> {
     match command {
+        Command::Init => {
+            if let Some(msg) = tokio::task::block_in_place(crate::setup::run_interactive)? {
+                println!("{msg}");
+            }
+            Ok(())
+        }
         Command::Mcp(McpCommand::Add(args)) => add(&args),
         Command::Mcp(McpCommand::List { check }) => list(check).await,
         Command::Mcp(McpCommand::Get { name }) => get(&name),
