@@ -43,6 +43,8 @@ pub enum AiEvent {
         name: String,
         args_json: String,
         is_dangerous: bool,
+        /// The agent's own reason for the call (`smart` mode only).
+        justification: Option<String>,
         /// Why the `smart`-mode reviewer passed this call to the user.
         review_note: Option<String>,
     },
@@ -110,6 +112,7 @@ struct PendingApproval {
     name: String,
     args_json: String,
     is_dangerous: bool,
+    justification: Option<String>,
     review_note: Option<String>,
 }
 
@@ -337,6 +340,7 @@ impl App {
                     name,
                     args_json,
                     is_dangerous,
+                    justification,
                     review_note,
                 } => {
                     self.pending_approval = Some(PendingApproval {
@@ -344,6 +348,7 @@ impl App {
                         name,
                         args_json,
                         is_dangerous,
+                        justification,
                         review_note,
                     });
                     self.auto_scroll = true;

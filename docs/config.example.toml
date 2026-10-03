@@ -51,7 +51,7 @@ max_turns = 25
 # Custom themes: start from a built-in `base` and override any colour.
 # Values are "#rrggbb", a colour name ("cyan", "light-blue", "dark-gray"), an
 # ANSI index ("208"), or "none" for the terminal's own default.
-# Keys: background text muted subtle user assistant system tool accent
+# Keys: background text muted subtle user user_bg assistant system tool accent
 #       on_accent success warning danger info diff_add diff_remove diff_hunk
 #       heading1 heading1_bg heading minor_heading code code_bg link quote
 # [themes.mocha-solid]

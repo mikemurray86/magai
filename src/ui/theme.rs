@@ -27,6 +27,9 @@ pub struct Theme {
     /// De-emphasised chrome: rules, popup borders, the model label, tool output.
     pub subtle: Color,
     pub user: Color,
+    /// Row background behind the user's own messages in the chat history;
+    /// `Reset` leaves only the `user`-coloured bar to mark them.
+    pub user_bg: Color,
     pub assistant: Color,
     pub system: Color,
     pub tool: Color,
@@ -64,6 +67,7 @@ impl Theme {
             muted: Color::Gray,
             subtle: Color::DarkGray,
             user: Color::Cyan,
+            user_bg: Color::Reset,
             assistant: Color::Green,
             system: Color::Yellow,
             tool: Color::Magenta,
@@ -116,6 +120,7 @@ impl Theme {
             muted: subtext0,
             subtle: overlay0,
             user: blue,
+            user_bg: surface0,
             assistant: green,
             system: yellow,
             tool: mauve,
@@ -209,6 +214,7 @@ impl Theme {
             "muted" => &mut self.muted,
             "subtle" => &mut self.subtle,
             "user" => &mut self.user,
+            "user_bg" => &mut self.user_bg,
             "assistant" => &mut self.assistant,
             "system" => &mut self.system,
             "tool" => &mut self.tool,

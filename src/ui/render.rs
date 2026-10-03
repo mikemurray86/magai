@@ -354,18 +354,27 @@ impl App {
             let card_w = (area.width.saturating_sub(8)).min(60);
             let inner_w = card_w.saturating_sub(4) as usize;
             let args_lines = word_wrap(&approval.args_json, inner_w);
+            let why_lines = approval
+                .justification
+                .as_deref()
+                .map(|j| word_wrap(&format!("Why: {j}"), inner_w))
+                .unwrap_or_default();
             let note_lines = approval
                 .review_note
                 .as_deref()
                 .map(|n| word_wrap(n, inner_w))
                 .unwrap_or_default();
-            // content rows: name + args + blank + keys (+ blank + note); +2 for border
-            let note_h = if note_lines.is_empty() {
-                0
-            } else {
-                1 + note_lines.len() as u16
+            // content rows: name + args + blank + keys (+ blank + why) (+ blank + note); +2 for border
+            let section_h = |lines: &[String]| {
+                if lines.is_empty() {
+                    0
+                } else {
+                    1 + lines.len() as u16
+                }
             };
-            let card_h = (5 + args_lines.len() as u16 + note_h).min(area.height.saturating_sub(2));
+            let card_h =
+                (5 + args_lines.len() as u16 + section_h(&why_lines) + section_h(&note_lines))
+                    .min(area.height.saturating_sub(2));
             let card_x = (area.width.saturating_sub(card_w)) / 2;
             let card_y = (area.height.saturating_sub(card_h)) / 2;
             let card_rect = Rect::new(card_x, card_y, card_w, card_h);
@@ -388,6 +397,15 @@ impl App {
                     format!("  {l}"),
                     Style::default().fg(t.muted),
                 )));
+            }
+            if !why_lines.is_empty() {
+                card_lines.push(Line::raw(""));
+                for l in &why_lines {
+                    card_lines.push(Line::from(Span::styled(
+                        format!("  {l}"),
+                        Style::default().fg(t.accent),
+                    )));
+                }
             }
             if !note_lines.is_empty() {
                 card_lines.push(Line::raw(""));
@@ -543,7 +561,22 @@ impl App {
 
                 let wrapped = word_wrap(&content, content_w);
                 for (i, chunk) in wrapped.into_iter().enumerate() {
-                    if i == 0 {
+                    if msg.role == Role::User {
+                        // A bar down the left edge and a tinted row, so your own
+                        // prompts stand out when scrolling back. The bar plus
+                        // label fills the same six columns as other labels.
+                        let bg = Style::default().bg(t.user_bg);
+                        let tag = if i == 0 { "you  " } else { "     " };
+                        // Byte length over-counts multibyte text, so the fill
+                        // may fall short but never overflows the row.
+                        let fill = " ".repeat(content_w.saturating_sub(chunk.len()));
+                        lines.push(Line::from(vec![
+                            Span::styled("▌", bg.fg(t.user)),
+                            Span::styled(tag, label_style.bg(t.user_bg)),
+                            Span::styled(chunk, text_style.bg(t.user_bg)),
+                            Span::styled(fill, bg),
+                        ]));
+                    } else if i == 0 {
                         lines.push(Line::from(vec![
                             Span::styled(label.clone(), label_style),
                             Span::styled(chunk, text_style),

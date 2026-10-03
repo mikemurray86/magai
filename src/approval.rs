@@ -192,6 +192,7 @@ impl GatedTool {
         &self,
         args: &str,
         dangerous: bool,
+        justification: Option<&str>,
         review_note: Option<String>,
     ) -> Result<(), ToolError> {
         let call_id = uuid::Uuid::new_v4().to_string();
@@ -204,6 +205,7 @@ impl GatedTool {
                 name: self.inner.name(),
                 args_json: args.to_string(),
                 is_dangerous: dangerous,
+                justification: justification.map(str::to_owned),
                 review_note,
             })
             .ok();
@@ -232,7 +234,7 @@ impl GatedTool {
         let prior = smart.denied.lock().unwrap().get(&key).cloned();
         if let Some(reason) = prior {
             let note = format!("Resubmitted after the reviewer declined it: {reason}");
-            return self.ask_user(args, true, Some(note)).await;
+            return self.ask_user(args, true, justification, Some(note)).await;
         }
 
         let request = smart.turn_request.lock().unwrap().clone();
@@ -240,15 +242,20 @@ impl GatedTool {
         match reply.as_deref().and_then(parse_review) {
             None => {
                 let note = "The reviewer gave no usable verdict.".to_string();
-                self.ask_user(args, true, Some(note)).await
+                self.ask_user(args, true, justification, Some(note)).await
             }
             Some(Review::Allow { reason }) => {
                 self.notice(format!("reviewer allowed {name}: {reason}"));
                 Ok(())
             }
             Some(Review::AskUser { reason }) => {
-                self.ask_user(args, true, Some(format!("Reviewer: {reason}")))
-                    .await
+                self.ask_user(
+                    args,
+                    true,
+                    justification,
+                    Some(format!("Reviewer: {reason}")),
+                )
+                .await
             }
             Some(Review::Suggest { reason, suggestion }) => {
                 self.notice(format!("reviewer declined {name}: {reason}"));
@@ -271,13 +278,13 @@ impl GatedTool {
         let dangerous = self.danger.check(args);
         match self.ctx.mode {
             PermissionMode::Auto => Ok(()),
-            PermissionMode::AskAlways => self.ask_user(args, dangerous, None).await,
+            PermissionMode::AskAlways => self.ask_user(args, dangerous, None, None).await,
             _ if !dangerous => Ok(()),
             PermissionMode::Smart => match self.smart() {
                 Some(smart) => self.review(smart, args, justification).await,
-                None => self.ask_user(args, true, None).await,
+                None => self.ask_user(args, true, None, None).await,
             },
-            PermissionMode::AskDangerous => self.ask_user(args, true, None).await,
+            PermissionMode::AskDangerous => self.ask_user(args, true, None, None).await,
         }
     }
 }
@@ -511,10 +518,12 @@ mod tests {
             tokio::task::yield_now().await;
             if let Some(AiEvent::ToolCallApprovalRequired {
                 call_id,
+                justification,
                 review_note,
                 ..
             }) = approval_requested(&mut events)
             {
+                assert_eq!(justification.as_deref(), Some("b"));
                 assert!(review_note.unwrap().contains("destroys data"));
                 break call_id;
             }
